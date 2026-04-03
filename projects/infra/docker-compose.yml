@@ -1,0 +1,149 @@
+version: '3.8'
+
+# 로컬 개발 환경 - 포트폴리오 프로젝트 공통 인프라
+# 실행: docker-compose up -d
+# 종료: docker-compose down -v
+
+services:
+
+  # ============================================================
+  # Kafka (KRaft 모드 - Zookeeper 없음, Kafka 3.x 이상)
+  # ADR-001 참고: RabbitMQ 대신 Kafka 선택
+  # ============================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: portfolio-kafka
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    healthcheck:
+      test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092" ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Kafka UI (선택) - 메시지 모니터링
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: portfolio-kafka-ui
+    ports:
+      - "8989:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ============================================================
+  # Redis
+  # 용도: 분산락(Redisson), 캐시(Cache-Aside), Bloom Filter
+  # ============================================================
+  redis:
+    image: redis:7.2-alpine
+    container_name: portfolio-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================
+  # MySQL
+  # ============================================================
+  mysql:
+    image: mysql:8.0
+    container_name: portfolio-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: portfolio
+      MYSQL_USER: portfolio
+      MYSQL_PASSWORD: portfolio
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # Prometheus - 메트릭 수집
+  # Spring Actuator + Micrometer로 JVM, Kafka Lag, HTTP 메트릭 수집
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: portfolio-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+
+  # ============================================================
+  # Grafana - 대시보드 시각화
+  # 포트폴리오 README에 스크린샷 첨부용
+  # ============================================================
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: portfolio-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+
+  # ============================================================
+  # k6 - 부하테스트
+  # 실행: docker-compose run --rm k6 run /scripts/load-test.js
+  # profiles로 기본 실행에서 제외 (명시적으로 실행할 때만)
+  # ============================================================
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    volumes:
+      - ./k6:/scripts
+    environment:
+      BASE_URL: http://host.docker.internal:8080
+    networks:
+      - default
+    depends_on:
+      - grafana
+
+volumes:
+  redis-data:
+  mysql-data:
+  grafana-data:
