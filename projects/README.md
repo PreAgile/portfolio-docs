@@ -3,114 +3,322 @@
 각 프로젝트는 독립적인 GitHub 리포지토리로 공개한다.
 회사 코드(TypeScript/Python)는 공개하지 않으며, **실제 운영에서 겪은 문제 패턴을 재설계한 것**임을 명시한다.
 
+> **핵심 변경 (2026-04-06):**
+> - 기존: 3개 프로젝트 전부 Kotlin
+> - 변경: **Project 1은 Java**, Project 2-3은 Kotlin → "Java도 Spring도 코드 레벨에서 쓸 수 있다"를 증명
+> - 근거: 10개사 JD 분석 결과 Java가 여전히 필수. Kotlin만으로는 "Java는 못 하는 사람" 리스크
+
 ---
 
-## 전체 구조
+## 전체 아키텍처
 
 ```
-                    [platform-api]
-                    ┌──────────────────────────────┐
-  사용자 요청 ──────▶│  Spring Boot 3.x + Kotlin    │
-                    │  - 가게/리뷰 도메인 API         │
-                    │  - Transactional Outbox       │
-                    │  - Redis 분산락               │
-                    │  - Circuit Breaker            │
-                    └───────────┬──────────────────┘
-                                │ Kafka (Outbox Relay)
-                                ▼
-                    [platform-event-consumer]
-                    ┌──────────────────────────────┐
-                    │  Spring Kafka + Kotlin        │
-                    │  - Idempotent Consumer        │
-                    │  - Dead Letter Queue          │
-                    │  - Consumer Lag 모니터링       │
-                    └──────────────────────────────┘
+                        [platform-api] ★ Java 17+
+                        ┌──────────────────────────────────────┐
+  사용자 요청 ──────────▶│  Spring Boot 3.x + Java              │
+                        │                                      │
+                        │  [결제 도메인]                         │
+                        │  ├─ @Transactional + REQUIRES_NEW    │
+                        │  ├─ @Version 옵티미스틱 락            │
+                        │  ├─ 멱등성 키 (IdempotencyKey)        │
+                        │  └─ 쿠폰/구독/빌링 트랜잭션          │
+                        │                                      │
+                        │  [공통 인프라]                         │
+                        │  ├─ Redisson 분산 락                  │
+                        │  ├─ Caffeine(L1) + Redis(L2) 캐시    │
+                        │  ├─ Transactional Outbox              │
+                        │  └─ Resilience4j Circuit Breaker      │
+                        └───────────┬──────────────────────────┘
+                                    │ Kafka (Outbox Relay)
+                                    ▼
+                        [platform-event-consumer] ★ Kotlin
+                        ┌──────────────────────────────────────┐
+                        │  Spring Boot 3.x + Kotlin + Coroutine│
+                        │                                      │
+                        │  ├─ Idempotent Consumer               │
+                        │  ├─ Dead Letter Topic                 │
+                        │  ├─ Consumer Lag 모니터링             │
+                        │  └─ 이벤트 기반 대시보드 집계         │
+                        └──────────────────────────────────────┘
 
-[async-crawler]  ──────────────────────────────────────▶  platform-api (결과 전달)
- - Kotlin Coroutines
- - Bloom Filter 중복 제거
- - Rate Limiting
- - Spring Batch 재시도
+[async-crawler] ★ Kotlin Coroutine
+  ┌─────────────────────────────┐
+  │  Kotlin + Spring Batch      │
+  │                             │
+  │  ├─ Structured Concurrency  │──────▶  platform-api (결과 전달)
+  │  ├─ Resilience4j 서킷 브레이커│
+  │  ├─ Rate Limiting           │
+  │  └─ Bloom Filter 중복 제거  │
+  └─────────────────────────────┘
+```
+
+**언어 선택 근거:**
+
+| 프로젝트 | 언어 | 이유 |
+|---------|------|------|
+| platform-api | **Java** | JD 교집합. "Java + Spring 코드 레벨" 증명. @Transactional 프록시, synchronized/Lock, CompletableFuture 등 Java 고유 패턴 사용 |
+| platform-event-consumer | **Kotlin** | Kafka Consumer에서 Coroutine 활용. suspend 함수 기반 비동기 처리. 토스/당근/우아한 타겟 |
+| async-crawler | **Kotlin** | Structured Concurrency, Flow, SupervisorJob. Coroutine의 장점이 가장 드러나는 영역 |
+
+---
+
+## 프로젝트 1: platform-api (Java)
+
+**상태**: 계획 중 → Phase 0에서 스켈레톤 생성
+**언어**: **Java 17+** + Spring Boot 3.x
+**GitHub**: (예정)
+
+### 연결된 실제 운영 문제 (EXPERIENCE-STORIES.md 참고)
+
+| 실무 문제 (cmong-*) | 포트폴리오에서 재설계 | Episode |
+|---------------------|---------------------|---------|
+| QueryRunner 수동 트랜잭션 15개 블록 (cmong-be) | `@Transactional` + `REQUIRES_NEW` + `TransactionTemplate` | #1 |
+| @VersionColumn 옵티미스틱 락 (cmong-be) | JPA `@Version` + `@Retryable` | #1 |
+| 웹훅 멱등성 체크 (cmong-be) | `IdempotencyKey` 엔티티 + 유니크 제약 | #1 |
+| Redis SET NX + Lua 분산 락 (cmong-be) | Redisson `tryLock` + watchdog | #2 |
+| L1+L2 2계층 캐시 (cmong-be) | Caffeine(L1) + Redis(L2) + `@Cacheable` | #6 |
+| 복합 인덱스 설계 (cmong-be) | JPA `@Index` + EXPLAIN ANALYZE 기록 | #3 |
+| 사전 계산 대시보드 (cmong-be) | Spring `@Scheduled` + 배치 집계 | #3 |
+
+### 핵심 기술 (Java 특화)
+
+```
+Java 동시성:
+├─ synchronized vs ReentrantLock (벤치마크 포함)
+├─ volatile + happens-before 관계 테스트
+├─ ConcurrentHashMap 활용 (로컬 캐시)
+├─ CompletableFuture 체이닝 (외부 API 병렬 호출)
+└─ Virtual Thread (Java 21) — 선택적
+
+Spring 내부 동작:
+├─ @Transactional 프록시 — self-invocation 문제 테스트로 검증
+├─ @Transactional(propagation = REQUIRES_NEW) — 부분 롤백
+├─ TransactionTemplate — 프로그래매틱 트랜잭션 (QueryRunner 대응)
+├─ AOP 프록시 — CGLIB vs JDK Dynamic Proxy 확인
+└─ Bean Lifecycle — @PostConstruct, @PreDestroy, SmartLifecycle
+
+JPA/Hibernate:
+├─ @Version 옵티미스틱 락 + 재시도
+├─ 복합 인덱스 @Index + EXPLAIN ANALYZE
+├─ N+1 문제 인지 + fetch join / EntityGraph 해결
+├─ 영속성 컨텍스트 1차 캐시 동작 확인
+└─ Querydsl 또는 JPQL로 복잡 쿼리
+
+분산 시스템:
+├─ Redisson 분산 락 (watchdog 자동 연장)
+├─ Resilience4j CircuitBreaker + Retry + RateLimiter
+├─ Transactional Outbox Pattern (outbox 테이블 + SELECT FOR UPDATE SKIP LOCKED)
+├─ Caffeine + Redis 2계층 캐시 + Stampede 방지
+└─ 멱등성 키 패턴
+```
+
+### 테스트 전략 (Java)
+
+```
+단위 테스트:
+├─ JUnit 5 + AssertJ
+├─ Mockito (외부 의존성 mock)
+└─ 옵티미스틱 락 충돌 재현 테스트
+
+통합 테스트:
+├─ Testcontainers (MySQL + Redis + Kafka)
+├─ @Transactional self-invocation 검증
+├─ 동시성 테스트: ExecutorService 100 스레드
+└─ EXPLAIN ANALYZE 결과 검증
+
+부하 테스트:
+├─ k6: P95 < 200ms, P99 < 500ms, 에러율 < 1%
+├─ HikariCP 커넥션 풀 사이즈별 비교
+└─ 캐시 히트/미스 시나리오별 TPS
+```
+
+### 폴더 구조 (예정)
+
+```
+platform-api/
+├── src/main/java/com/portfolio/platform/
+│   ├── payment/
+│   │   ├── domain/          (Billing, Subscription, Coupon, IdempotencyKey)
+│   │   ├── service/         (PaymentService, CouponService)
+│   │   ├── repository/
+│   │   └── api/             (PaymentController)
+│   ├── dashboard/
+│   │   ├── domain/          (BrandDashboardDaily)
+│   │   ├── service/         (DashboardAggregationService)
+│   │   └── batch/           (DailyAggregationJob)
+│   ├── common/
+│   │   ├── lock/            (DistributedLockService — Redisson)
+│   │   ├── cache/           (TwoLayerCacheService — Caffeine+Redis)
+│   │   ├── outbox/          (OutboxEntity, OutboxRelayService)
+│   │   ├── resilience/      (CircuitBreaker 설정)
+│   │   └── idempotency/     (IdempotencyKeyService)
+│   └── config/
+│       ├── RedisConfig.java
+│       ├── CacheConfig.java
+│       └── ResilienceConfig.java
+├── src/test/java/com/portfolio/platform/
+│   ├── payment/             (트랜잭션, 옵티미스틱 락, 멱등성 테스트)
+│   ├── common/lock/         (분산 락 동시성 테스트)
+│   ├── common/cache/        (2계층 캐시 + Stampede 테스트)
+│   └── integration/         (Testcontainers 통합 테스트)
+├── build.gradle.kts
+├── docker-compose.yml       (로컬 개발용)
+└── README.md                (실측 수치 + 아키텍처)
 ```
 
 ---
 
-## 프로젝트 1: platform-api
+## 프로젝트 2: platform-event-consumer (Kotlin)
+
 **상태**: 계획 중
+**언어**: **Kotlin** + Spring Boot 3.x + Spring Kafka + Coroutine
 **GitHub**: (예정)
 
-**연결된 실제 운영 문제**:
-- 동시 요청에서 토큰 값 덮어쓰기 (cmong-mq #388)
-- 외부 크롤링 API 장애 시 전체 지연 (cmong-mq #387)
-- DB 저장 후 이벤트 발행 전 크래시 시 유실
+### 연결된 실제 운영 문제
 
-**핵심 기술**:
-- Kotlin + Spring Boot 3.x
-- Transactional Outbox Pattern
-- Redis 분산락 (Redisson) + Cache Stampede 방지
-- Circuit Breaker (Resilience4j)
+| 실무 문제 (cmong-*) | 포트폴리오에서 재설계 | Episode |
+|---------------------|---------------------|---------|
+| RabbitMQ persistent + prefetch=1 (cmong-be) | Kafka Manual Commit + AckMode | #4 |
+| MqErrorLogs DLQ 패턴 (cmong-mq) | Kafka Dead Letter Topic | #4 |
+| 4단계 에러 분류 (cmong-mq) | 에러 핸들러 + ErrorClassifier | #4 |
+| EventEmitter2 이벤트 (cmong-be) | Transactional Outbox → Kafka | #4 |
+| 임계값 기반 알림 (cmong-mq) | Consumer Lag 모니터링 + 알림 | #4 |
 
-**테스트 목표**:
-- Testcontainers: MySQL + Redis + Kafka 통합 테스트
-- 동시성 테스트: 100 스레드 동시 요청 시 데이터 정합성
-- k6: P95 < 200ms, 에러율 < 1%
+### 핵심 기술 (Kotlin 특화)
 
-**폴더**: `./platform-api/` (예정)
+```
+Kotlin Coroutine:
+├─ suspend 함수 기반 메시지 처리
+├─ withContext(Dispatchers.IO) — JPA 블로킹 격리
+├─ SupervisorJob — 개별 메시지 실패 격리
+└─ Flow<T> — 이벤트 스트림 처리
+
+Spring Kafka:
+├─ Manual Commit (AckMode.MANUAL_IMMEDIATE)
+├─ Idempotent Consumer (processed_events 테이블)
+├─ @RetryableTopic → Dead Letter Topic
+├─ ErrorHandler + SeekToCurrentErrorHandler
+└─ Consumer Lag Micrometer 메트릭
+
+모니터링:
+├─ Prometheus + Grafana 대시보드
+├─ Consumer Lag → TPS 상관관계 실측
+└─ 장애 주입: docker stop kafka → 복구 시간 측정
+```
+
+### 테스트 전략 (Kotlin)
+
+```
+단위 테스트:
+├─ kotest + AssertJ (기존 kotest 기여 경험 활용)
+├─ MockK (Kotlin 특화 mocking)
+└─ 멱등성: 동일 메시지 3회 → DB 1건 검증
+
+통합 테스트:
+├─ Testcontainers (Kafka + MySQL)
+├─ EmbeddedKafka 대안 비교
+├─ Consumer rebalancing 시나리오
+└─ DLT 최종 처리 검증
+```
+
+### 폴더 구조 (예정)
+
+```
+platform-event-consumer/
+├── src/main/kotlin/com/portfolio/consumer/
+│   ├── event/
+│   │   ├── handler/         (ReviewEventHandler, OrderEventHandler)
+│   │   ├── idempotency/     (ProcessedEventRepository)
+│   │   └── dlt/             (DeadLetterHandler)
+│   ├── aggregation/
+│   │   ├── service/         (DashboardAggregationService)
+│   │   └── domain/          (AggregationResult)
+│   └── config/
+│       ├── KafkaConsumerConfig.kt
+│       └── MonitoringConfig.kt
+├── src/test/kotlin/
+│   ├── event/               (멱등성, DLT 테스트)
+│   └── integration/         (Testcontainers Kafka)
+└── build.gradle.kts
+```
 
 ---
 
-## 프로젝트 2: platform-event-consumer
-**상태**: 계획 중
+## 프로젝트 3: async-crawler (Kotlin)
+
+**상태**: 계획 중 (Phase 2에서 구현)
+**언어**: **Kotlin** + Spring Batch + Coroutine
 **GitHub**: (예정)
 
-**연결된 실제 운영 문제**:
-- Consumer 재시작 시 메시지 처리 중 유실
-- 중복 처리로 DB 데이터 중복 저장 (Fix duplicate error)
-- 처리 실패 메시지 방치
+### 연결된 실제 운영 문제
 
-**핵심 기술**:
-- Kotlin + Spring Boot 3.x + Spring Kafka
-- Idempotent Consumer (processed_events 테이블)
-- Dead Letter Topic + 재처리 전략
-- Micrometer + Prometheus + Grafana (Consumer Lag)
+| 실무 문제 (cmong-*) | 포트폴리오에서 재설계 | Episode |
+|---------------------|---------------------|---------|
+| ThreadPoolExecutor + Lock (cmong-mq) | Kotlin Coroutine + Mutex | #4, #6 |
+| 적응형 트래픽 제어 (cmong-scraper) | Resilience4j CircuitBreaker + RateLimiter | #5 |
+| 플랫폼 계정별 순차 처리 (cmong-mq) | Coroutine + Semaphore per account | #6 |
+| 에러 비율 임계값 알림 (cmong-mq) | Micrometer 메트릭 + 알림 | #5 |
+| Graceful Shutdown (cmong-scraper) | SmartLifecycle + Drain Mode | #7 |
 
-**테스트 목표**:
-- 멱등성: 동일 메시지 3회 발행 시 DB에 1건만 저장
-- DLT: 실패 메시지 최종 처리 검증
+### 핵심 기술 (Kotlin Coroutine 특화)
 
-**폴더**: `./platform-event-consumer/` (예정)
+```
+Structured Concurrency:
+├─ coroutineScope { } — 구조화된 동시성
+├─ supervisorScope { } — 장애 격리
+├─ async/await — 병렬 크롤링
+├─ Flow<T> — 데이터 스트림
+└─ Semaphore — 계정별 동시성 제한
 
----
+Spring Batch:
+├─ Chunk 기반 처리 (Reader → Processor → Writer)
+├─ Partitioned Step — 병렬 배치
+├─ Retry + Skip Policy
+└─ Job Repository (재시작 지원)
 
-## 프로젝트 3: async-crawler
-**상태**: 계획 중
-**GitHub**: (예정)
+Resilience:
+├─ Resilience4j CircuitBreaker (에러율 기반)
+├─ Bucket4j Rate Limiting
+├─ Bloom Filter (Redis) — 중복 URL 제거
+└─ Graceful Shutdown (SmartLifecycle)
+```
 
-**연결된 실제 운영 문제**:
-- 동일 URL 중복 크롤링 자원 낭비
-- Rate Limit 초과로 IP 차단 이슈
-- 크롤링 실패 시 재시도 전략 부재
+### 폴더 구조 (예정)
 
-**핵심 기술**:
-- Kotlin Coroutines + Spring WebClient
-- Redis Bloom Filter 중복 URL 체크
-- Bucket4j Rate Limiting
-- Spring Batch Chunk + Retry Policy
-
-**폴더**: `./async-crawler/` (예정)
+```
+async-crawler/
+├── src/main/kotlin/com/portfolio/crawler/
+│   ├── crawl/
+│   │   ├── service/         (CrawlOrchestrator — supervisorScope)
+│   │   ├── client/          (PlatformClient — WebClient + CircuitBreaker)
+│   │   └── dedup/           (BloomFilterService)
+│   ├── batch/
+│   │   ├── job/             (CrawlBatchJob — Spring Batch)
+│   │   └── step/            (PartitionedCrawlStep)
+│   ├── resilience/
+│   │   ├── config/          (CircuitBreakerConfig, RateLimiterConfig)
+│   │   └── monitor/         (ErrorRateMonitor)
+│   └── config/
+└── src/test/kotlin/
+    ├── crawl/               (Coroutine 동시성 테스트)
+    └── integration/         (서킷 브레이커 상태 전환 테스트)
+```
 
 ---
 
 ## 공통 인프라
+
 **폴더**: `./infra/`
 
-로컬 개발 환경 (docker-compose.yml):
-- Kafka (KRaft 모드, Zookeeper 없음)
-- Redis
-- MySQL
-- Prometheus + Grafana
-- k6 (부하테스트)
-- Kafka UI
+```yaml
+# docker-compose.yml 포함 서비스:
+- Kafka (KRaft 모드, Zookeeper 없음) + Kafka UI
+- Redis 7.2 (256MB, LRU eviction)
+- MySQL 8.0 (3개 DB: api_server, event_pipeline, crawler_engine)
+- Prometheus (Spring Actuator + Kafka JMX 메트릭 수집)
+- Grafana (대시보드 — Consumer Lag, TPS, P99, GC)
+- k6 (부하테스트 — --profile loadtest로 실행)
+```
 
 **실행**:
 ```bash
@@ -120,3 +328,32 @@ docker-compose up -d
 # Grafana: http://localhost:3000 (admin/admin)
 # Prometheus: http://localhost:9090
 ```
+
+---
+
+## 왜 Java + Kotlin 혼합인가? (면접 방어)
+
+**Q: "왜 하나의 언어로 통일하지 않았나?"**
+
+> 실무에서도 서비스 성격에 따라 최적의 언어가 다릅니다.
+> 
+> **platform-api (Java)**: 결제 도메인은 @Transactional 프록시, 동시성 제어(synchronized, Lock),
+> CompletableFuture 등 Java의 동시성 기본기가 중요합니다. 또한 JPA/Hibernate와의 호환성이
+> Kotlin보다 Java에서 더 자연스럽고, 팀에 Java 개발자가 많은 환경을 고려했습니다.
+>
+> **platform-event-consumer (Kotlin)**: 이벤트 처리는 suspend 함수 기반 비동기 처리가 적합하고,
+> withContext(Dispatchers.IO)로 블로킹 I/O를 격리하는 Coroutine의 장점이 극대화됩니다.
+>
+> **async-crawler (Kotlin)**: 수백 개의 동시 크롤링 작업을 Structured Concurrency로 관리하고,
+> SupervisorJob으로 개별 실패를 격리하는 것이 Thread 기반보다 자원 효율적입니다.
+>
+> 한마디로: "도구를 상황에 맞게 선택할 수 있다"를 보여주는 것이 목적입니다.
+
+---
+
+## 변경 이력
+
+| 날짜 | 변경 내용 |
+|------|----------|
+| 2026-04-03 | 초안. 3개 프로젝트 전부 Kotlin |
+| 2026-04-06 | **Project 1을 Java로 변경**. 10개사 JD 분석 + 실무 경험(EXPERIENCE-STORIES.md) 반영. Java 동시성/Spring 내부 동작/JPA 코드 포함. 면접 방어 섹션 추가 |
