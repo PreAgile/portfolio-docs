@@ -187,7 +187,7 @@ if (instance == null) {           // 1. check
 
 **[실무 연결]**
 - cmong-mq: threading.Lock() + queue.Queue() (Python 동시성)
-- cmong-scraper: async-mutex, SessionLockRegistry (FIFO/PRIORITY)
+- 분산 수집 시스템: async-mutex, SessionLockRegistry (FIFO/PRIORITY 큐, Lease TTL 90초)
 - cmong-be: Redis SET NX + Lua (분산 환경 동시성)
 - 이 경험들을 Java synchronized/ReentrantLock 관점으로 변환 가능
 
@@ -271,7 +271,7 @@ public class PaymentService {
 
 **[실무 연결]**
 - cmong-be (NestJS): @Module + @Injectable = Spring의 @Configuration + @Component
-- cmong-scraper: Request-scoped 서비스 (Scope.REQUEST) = Spring의 @RequestScope
+- 분산 수집 시스템: Request-scoped 서비스 (Scope.REQUEST) = Spring의 @RequestScope
 - cmong-be: onApplicationShutdown() = Spring의 @PreDestroy
 
 ---
@@ -336,7 +336,7 @@ public class PaymentService {
 - 실무: 캐시 데이터는 유실되어도 DB에서 재로드 가능하므로 비동기 복제 허용
 
 **[실무 연결]**
-- cmong-be/scraper: L1(In-Memory 5분) + L2(Redis 24시간) 2계층 캐시
+- 실무: L1(In-Memory 5분) + L2(Redis 24시간) 2계층 캐시 (API 서버 + 분산 수집 시스템 양쪽에서 사용)
 - cmong-be: 이벤트 기반 캐시 무효화 (EventEmitter2 → 캐시 삭제)
 - cmong-ml: Cache-First + 프리픽스 기반 벌크 삭제
 - ADR-003: Cache-Aside + 분산 락 (Stampede 방지) 결정 근거

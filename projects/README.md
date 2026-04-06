@@ -58,7 +58,7 @@
 |---------|------|------|
 | platform-api | **Java** | JD 교집합. "Java + Spring 코드 레벨" 증명. @Transactional 프록시, synchronized/Lock, CompletableFuture 등 Java 고유 패턴 사용 |
 | platform-event-consumer | **Kotlin** | Kafka Consumer에서 Coroutine 활용. suspend 함수 기반 비동기 처리. 토스/당근/우아한 타겟 |
-| async-crawler | **Kotlin** | Structured Concurrency, Flow, SupervisorJob. Coroutine의 장점이 가장 드러나는 영역 |
+| async-crawler | **Kotlin** | Structured Concurrency로 수백 개 동시 외부 API 호출 관리. 서킷 브레이커 + Rate Limiting + Graceful Shutdown — 실무 분산 수집 시스템 패턴을 Kotlin으로 재설계 |
 
 ---
 
@@ -244,21 +244,25 @@ platform-event-consumer/
 
 ---
 
-## 프로젝트 3: async-crawler (Kotlin)
+## 프로젝트 3: async-crawler (Kotlin) — 분산 외부 API 호출 시스템
 
 **상태**: 계획 중 (Phase 2에서 구현)
 **언어**: **Kotlin** + Spring Batch + Coroutine
 **GitHub**: (예정)
 
+> **이 프로젝트의 포지셔닝**: 실무에서 6개 외부 플랫폼 대상 분산 데이터 수집 시스템을 설계/운영한 경험을
+> Kotlin Coroutine + Spring Batch로 재설계. 스크래핑 로직이 아닌 **분산 시스템 패턴**(서킷 브레이커,
+> Rate Limiting, 리소스 풀, Graceful Shutdown)에 초점.
+
 ### 연결된 실제 운영 문제
 
-| 실무 문제 (cmong-*) | 포트폴리오에서 재설계 | Episode |
-|---------------------|---------------------|---------|
-| ThreadPoolExecutor + Lock (cmong-mq) | Kotlin Coroutine + Mutex | #4, #6 |
-| 적응형 트래픽 제어 (cmong-scraper) | Resilience4j CircuitBreaker + RateLimiter | #5 |
-| 플랫폼 계정별 순차 처리 (cmong-mq) | Coroutine + Semaphore per account | #6 |
-| 에러 비율 임계값 알림 (cmong-mq) | Micrometer 메트릭 + 알림 | #5 |
-| Graceful Shutdown (cmong-scraper) | SmartLifecycle + Drain Mode | #7 |
+| 실무 문제 | 분산 시스템 관점 | 포트폴리오에서 재설계 | Episode |
+|----------|---------------|---------------------|---------|
+| 스레드 풀 + Lock 동시성 제어 | 리소스 경합 + 상호 배제 | Kotlin Coroutine + Mutex | #4, #6 |
+| 적응형 트래픽 제어 (3단계 서킷 브레이커) | 외부 의존성 장애 격리 | Resilience4j CircuitBreaker + RateLimiter | #5 |
+| 계정별 순차 처리 (세션 직렬화) | 분산 큐 + 공정성 보장 | Coroutine + Semaphore per account | #6 |
+| 에러 비율 임계값 알림 | 관측성 + 알림 파이프라인 | Micrometer 메트릭 + 알림 | #5 |
+| Drain Mode + 좀비 프로세스 정리 | 무중단 배포 + 리소스 누수 방지 | SmartLifecycle + Drain Mode | #7 |
 
 ### 핵심 기술 (Kotlin Coroutine 특화)
 
@@ -266,7 +270,7 @@ platform-event-consumer/
 Structured Concurrency:
 ├─ coroutineScope { } — 구조화된 동시성
 ├─ supervisorScope { } — 장애 격리
-├─ async/await — 병렬 크롤링
+├─ async/await — 병렬 외부 API 호출
 ├─ Flow<T> — 데이터 스트림
 └─ Semaphore — 계정별 동시성 제한
 
@@ -344,7 +348,7 @@ docker-compose up -d
 > **platform-event-consumer (Kotlin)**: 이벤트 처리는 suspend 함수 기반 비동기 처리가 적합하고,
 > withContext(Dispatchers.IO)로 블로킹 I/O를 격리하는 Coroutine의 장점이 극대화됩니다.
 >
-> **async-crawler (Kotlin)**: 수백 개의 동시 크롤링 작업을 Structured Concurrency로 관리하고,
+> **async-crawler (Kotlin)**: 수백 개의 동시 외부 API 호출을 Structured Concurrency로 관리하고,
 > SupervisorJob으로 개별 실패를 격리하는 것이 Thread 기반보다 자원 효율적입니다.
 >
 > 한마디로: "도구를 상황에 맞게 선택할 수 있다"를 보여주는 것이 목적입니다.

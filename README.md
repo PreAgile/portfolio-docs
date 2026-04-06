@@ -10,7 +10,7 @@
 ```
 ① EXPERIENCE-STORIES.md  ← 먼저 읽기. "이 사람이 실무에서 뭘 했는가"
 │    7개 핵심 에피소드: 결제 트랜잭션, 분산 락, 대시보드 최적화, MQ 에러 복구,
-│    서킷 브레이커, 2계층 캐시, Akamai 봇 탐지 우회
+│    서킷 브레이커, 2계층 캐시, 분산 세션 관리, TLS 프로토콜 디버깅
 │    각 에피소드: 문제 → 선택지 → 트레이드오프 → 결정 → 결과 → Java/Spring 대응
 │
 ② STRATEGY-V2.md  ← "어떤 전략으로 준비하고 있는가"
@@ -117,7 +117,8 @@ resume/
 
   [async-crawler] ★ Kotlin ────────────────▶ platform-api
    Coroutine + Spring Batch
-   서킷 브레이커 + Rate Limiting
+   서킷 브레이커 + Rate Limiting + Graceful Shutdown
+   (실무 분산 수집 시스템 패턴을 Kotlin으로 재설계)
 ```
 
 **왜 Java + Kotlin 혼합?** → [projects/README.md](projects/README.md#왜-java--kotlin-혼합인가-면접-방어)에서 상세 설명
