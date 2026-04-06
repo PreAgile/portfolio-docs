@@ -72,17 +72,22 @@ resume/
 
 ---
 
+## 서비스 컨텍스트
+
+6개 외부 플랫폼의 리뷰/주문/매출 데이터를 실시간 수집하여 기업 고객에게 대시보드로 제공하는 **B2B SaaS**.
+메인 담당: **대규모 외부 데이터 수집 파이프라인의 분산 아키텍처 설계/운영** + 결제/구독 + 대용량 집계.
+
 ## 실무에서 겪은 문제 → 이 포트폴리오로 재설계
 
-| 실무 문제 | 실무 해결 (Node.js/Python) | 포트폴리오 재설계 (Java/Kotlin) | 에피소드 |
-|----------|--------------------------|-------------------------------|---------|
-| 결제에서 5개 엔티티 원자적 업데이트 | QueryRunner 수동 트랜잭션 15개 블록 | `@Transactional` + `REQUIRES_NEW` + `TransactionTemplate` | #1 |
-| 다중 인스턴스 크론잡 중복 실행 | Redis SET NX + Lua 스크립트 | Redisson `tryLock` + watchdog | #2 |
-| 수십만 shop 대시보드 집계 느림 | 사전 계산 테이블 + 복합 인덱스 + 2계층 캐시 | Spring Batch + JPA `@Index` + Caffeine+Redis | #3 |
-| 스크래핑 실패 시 무한 재시도 | 4단계 에러 분류 + DLQ 패턴 + 임계값 알림 | Spring Kafka + DLT + `@RetryableTopic` | #4 |
-| 외부 플랫폼 차단 폭증 시 IP 블랙리스트 | 적응형 트래픽 제어 (Redis Lua 토큰 버킷) | Resilience4j CircuitBreaker + RateLimiter | #5 |
-| 배치 후 캐시 만료 동시 발생 (Stampede) | L1(5분)+L2(24시간) + 분산 락 | Caffeine + Redis + `@Cacheable(sync=true)` | #6 |
-| Akamai 봇 탐지로 95% 차단 | Camoufox + TLS 핑거프린트 우회 + 좀비 프로세스 관리 | Resilience4j + SmartLifecycle + 리소스 풀 패턴 | #7 |
+| 실무 문제 | 분산 시스템 관점 | 포트폴리오 재설계 (Java/Kotlin) | 에피소드 |
+|----------|----------------|-------------------------------|---------|
+| 결제에서 5개 엔티티 원자적 업데이트 | 다단계 트랜잭션 + 부분 롤백 | `@Transactional` + `REQUIRES_NEW` + `TransactionTemplate` | #1 |
+| 다중 인스턴스 크론잡 중복 실행 | 분산 환경 상호 배제 | Redisson `tryLock` + watchdog | #2 |
+| 수십만 shop × 수천만 리뷰 집계 | 대용량 데이터 배치 + 읽기 최적화 | Spring Batch + JPA `@Index` + Caffeine+Redis | #3 |
+| 외부 API 실패 시 무한 재시도 + 알림 피로 | 에러 분류 체계 + Dead Letter + 임계값 기반 관측 | Spring Kafka + DLT + `@RetryableTopic` | #4 |
+| 외부 플랫폼 장애 폭증 시 연쇄 실패 | **서킷 브레이커 + 적응형 라우팅 + 리소스 풀** | Resilience4j + HikariCP 패턴 + SmartLifecycle | #5 |
+| 배치 후 캐시 만료 동시 발생 | Cache Stampede 방지 | Caffeine + Redis + `@Cacheable(sync=true)` | #6 |
+| 30+ 인스턴스 세션 풀 관리 + 무중단 배포 | **분산 큐 + Lease + Graceful Shutdown** | Redis 분산 큐 + K8s PreStop Hook 패턴 | #7 |
 
 ---
 
