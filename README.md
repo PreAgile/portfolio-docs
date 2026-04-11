@@ -23,12 +23,21 @@
 │    현재 10개 PR 분석 + 타겟 프로젝트별 이슈 + 머지 확률 + 면접 방어
 │
 ⑤ docs/adr/  ← "기술 결정의 근거"
-│    ADR-001 Kafka vs RabbitMQ, ADR-002 Coroutines vs VT, ADR-003 Cache
+│    ADR-001~005: Kafka, Coroutines, Cache, 분산락, Outbox Relay
 │
-⑥ docs/interview-prep/depth-guide.md  ← "면접 꼬리질문 어떻게 방어하는가"
+⑥ docs/ddd/DOMAIN-MODEL.md  ← "도메인 설계 어떻게 했는가"
+│    Bounded Context 4개, Aggregate 정의, Domain Event 목록
+│
+⑦ docs/architecture/MSA-BOUNDARY.md  ← "왜 이렇게 나눴는가"
+│    3개 서비스 분리 근거, Business Capability 기준, 통신 패턴
+│
+⑧ docs/ai/AI-DESIGN-LOG.md  ← "AI를 어떻게 설계 도구로 썼는가"
+│    문제 정의 → AI 질문 → 내 판단 → 최종 결정 로그 4개
+│
+⑨ docs/interview-prep/depth-guide.md  ← "면접 꼬리질문 어떻게 방어하는가"
 │    9개 영역 × 4단계 깊이 + 실무 연결 + 회사별 맞춤
 │
-⑦ LEARNING-LOG.md  ← "공부하면서 배운 것 기록"
+⑩ LEARNING-LOG.md  ← "공부하면서 배운 것 기록"
 ```
 
 ---
@@ -36,38 +45,53 @@
 ## 전체 구조
 
 ```
-resume/
+portfolio-docs/
 ├── README.md                    ← 지금 읽고 있는 파일. 진입점
 │
 ├── EXPERIENCE-STORIES.md        ← ① 실무 경험 스토리북 (7개 에피소드)
 ├── STRATEGY-V2.md               ← ② 이직 전략 V2 (10개사 JD + Phase 0~4)
 ├── STRATEGY.md                  ← (V1 — 아카이브)
 ├── FEEDBACK.md                  ← 전략 갭 분석 + 개선 포인트
-├── LEARNING-LOG.md              ← ⑦ 학습 일지
+├── LEARNING-LOG.md              ← ⑩ 학습 일지 (구현하면서 배운 것)
 ├── CLAUDE.md                    ← AI 협업 규칙 (이 저장소의 작업 가이드)
 │
 ├── projects/                    ← ③ 포트폴리오 프로젝트
 │   ├── README.md                ← 3개 프로젝트 설계 + 언어 선택 근거
-│   ├── infra/                   ← 공통 인프라 (docker-compose)
-│   │   ├── docker-compose.yml   (Kafka, Redis, MySQL, Prometheus, Grafana, k6)
-│   │   ├── k6/load-test.js
-│   │   ├── mysql/init.sql
-│   │   └── prometheus/prometheus.yml
-│   ├── platform-api/            ← (예정) Java + Spring Boot 3.x
-│   ├── platform-event-consumer/ ← (예정) Kotlin + Spring Kafka
-│   └── async-crawler/           ← (예정) Kotlin Coroutine + Spring Batch
+│   └── infra/                   ← 공통 인프라 (docker-compose)
+│       ├── docker-compose.yml   (Kafka, Redis, MySQL, Prometheus, Grafana, k6)
+│       ├── k6/load-test.js
+│       ├── mysql/init.sql
+│       └── prometheus/prometheus.yml
 │
 └── docs/
     ├── adr/                     ← ⑤ Architecture Decision Records
     │   ├── ADR-001-kafka-vs-rabbitmq.md
     │   ├── ADR-002-coroutines-vs-virtual-threads.md
     │   ├── ADR-003-cache-strategy.md
+    │   ├── ADR-004-distributed-lock.md       ← Redisson vs SET NX+Lua
+    │   ├── ADR-005-outbox-relay.md           ← 폴링 vs CDC
     │   └── ADR-TEMPLATE.md
-    ├── interview-prep/          ← ⑥ 면접 준비
-    │   ├── depth-guide.md       ← 꼬리질문 4단계 방어 가이드
-    │   └── ADR-001-interview-questions.md
-    ├── OPENSOURCE-STRATEGY.md    ← ④ 오픈소스 기여 전략
-    └── job-market/              ← JD 분석 자료
+    │
+    ├── ddd/                     ← ⑥ 도메인 설계
+    │   └── DOMAIN-MODEL.md      ← Bounded Context 4개, Aggregate, Domain Event
+    │
+    ├── architecture/            ← ⑦ MSA 설계
+    │   └── MSA-BOUNDARY.md      ← 3개 서비스 분리 근거, 통신 패턴
+    │
+    ├── ai/                      ← ⑧ AI 설계 협업 로그
+    │   └── AI-DESIGN-LOG.md     ← 문제 정의 → AI 질문 → 판단 → 결정 기록
+    │
+    ├── interview-prep/          ← ⑨ 면접 준비
+    │   ├── depth-guide.md       ← 꼬리질문 4단계 방어 가이드 (9개 영역)
+    │   └── ADR-001-interview-questions.md  ← Kafka 면접 Q&A
+    │
+    ├── benchmarks/              ← 성능 측정 결과
+    │   └── PERFORMANCE-RESULTS.md  ← k6 실측 수치 (Phase 1 완료 후 채워질 것)
+    │
+    ├── OPENSOURCE-STRATEGY.md   ← ④ 오픈소스 기여 전략
+    ├── OSS-CONTRIBUTION-TARGETS.md
+    └── job-market/              ← JD 분석
+        └── JD-ANALYSIS.md       ← 7개사 JD 분석 + 준비 우선순위
 ```
 
 ---
@@ -149,8 +173,8 @@ resume/
 | [ADR-001](docs/adr/ADR-001-kafka-vs-rabbitmq.md) | 메시지 브로커 | Kafka (재처리, Consumer Group, 파티션 순서) | Episode #4 |
 | [ADR-002](docs/adr/ADR-002-coroutines-vs-virtual-threads.md) | 비동기 처리 | Kotlin Coroutines (Structured Concurrency) | Episode #5, #7 |
 | [ADR-003](docs/adr/ADR-003-cache-strategy.md) | 캐시 전략 | Cache-Aside + 분산 락 (Stampede 방지) | Episode #6 |
-| ADR-004 (예정) | 분산 락 구현 | Redisson vs SET NX+Lua | Episode #2 |
-| ADR-005 (예정) | Outbox Relay 주기 | 폴링 vs CDC | Episode #4 |
+| [ADR-004](docs/adr/ADR-004-distributed-lock.md) | 분산 락 구현 | Redisson (Watchdog + 좀비 락 방지) | Episode #2 |
+| [ADR-005](docs/adr/ADR-005-outbox-relay.md) | Outbox Relay | 폴링 5초 (vs CDC 복잡도) | Episode #4 |
 
 ---
 
@@ -227,8 +251,13 @@ docker-compose --profile loadtest run --rm k6 run /scripts/load-test.js
 | 이직 전략 V2 (STRATEGY-V2.md) | ✅ 완료 |
 | 오픈소스 전략 (OPENSOURCE-STRATEGY.md) | ✅ 완료 |
 | 면접 깊이 가이드 (depth-guide.md) | ✅ 완료 |
-| ADR 3개 (Kafka, Coroutine, Cache) | ✅ 완료 |
+| ADR 5개 (Kafka, Coroutine, Cache, 분산락, Outbox) | ✅ 완료 |
 | ADR-001 면접 Q&A | ✅ 완료 |
+| DDD 도메인 모델 (DOMAIN-MODEL.md) | ✅ 완료 |
+| MSA 서비스 경계 설계 (MSA-BOUNDARY.md) | ✅ 완료 |
+| AI 설계 협업 로그 (AI-DESIGN-LOG.md) | ✅ 완료 |
+| JD 분석 문서 (JD-ANALYSIS.md) | ✅ 완료 |
+| 성능 측정 계획 (PERFORMANCE-RESULTS.md) | ✅ 시나리오 작성 완료, 실측 대기 |
 | 프로젝트 설계 리팩토링 (Java+Kotlin) | ✅ 완료 |
 | docker-compose 인프라 | ✅ 완료 |
 | k6 부하 테스트 스크립트 | ✅ 완료 |
@@ -236,7 +265,7 @@ docker-compose --profile loadtest run --rm k6 run /scripts/load-test.js
 | **platform-event-consumer (Kotlin)** | 🔜 Phase 1 |
 | **async-crawler (Kotlin)** | 🔜 Phase 2 |
 | **Resilience4j PR** | 🔜 Phase 2 |
-| k6 실측 수치 | 🔜 Phase 2 |
+| k6 실측 수치 채우기 | 🔜 Phase 1 완료 후 |
 | Grafana 대시보드 스크린샷 | 🔜 Phase 3 |
 
 ---
