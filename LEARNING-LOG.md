@@ -40,25 +40,27 @@
 
 ## Track 1 — 동시성 & 분산 락
 
-### 락 없이 100 스레드 동시 출금 — 데이터 불일치 재현
+### 락 없이 100 스레드 동시 토큰 갱신 — lost update 재현
 
 **날짜**: (예정)
 **Track**: Track 1 — 동시성 & 분산 락
-**가설**: "락 없이 100 스레드가 동시에 같은 계좌에서 1원씩 출금하면, 최종 잔액이 기대값과 다를 것이다"
+**가설**: "락 없이 100 스레드가 동시에 같은 토큰을 갱신하면, 최종 refreshCount가 100보다 적을 것이다 (lost update)"
 **실험 방법**:
 ```java
 // ExecutorService로 100 스레드 동시 실행
 ExecutorService executor = Executors.newFixedThreadPool(100);
+CountDownLatch latch = new CountDownLatch(100);
 IntStream.range(0, 100).forEach(i ->
-    executor.submit(() -> accountService.withdraw(accountId, 1))
+    executor.submit(() -> { noLockTokenService.refresh(tokenId); latch.countDown(); })
 );
-// 기대 잔액: 초기 10000 - 100 = 9900
-// 실제 잔액: ???
+latch.await();
+// 기대 refreshCount: 100
+// 실제 refreshCount: ???
 ```
 **결과**: (실측 후 기록)
 **발견**: (실측 후 기록)
 **다음 질문**: "synchronized를 적용하면 정합성은 보장되지만 TPS는 얼마나 감소하는가?"
-**면접 한 줄**: "락 없이 100 스레드 동시 출금 시 잔액이 X원 차이 나는 것을 실험으로 확인했습니다"
+**면접 한 줄**: "락 없이 100 스레드 동시 갱신 시 X건의 lost update가 발생하는 것을 실험으로 확인했습니다"
 
 ### synchronized vs 분산 환경 — JVM 락의 한계 증명
 
