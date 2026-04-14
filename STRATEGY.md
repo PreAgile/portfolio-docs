@@ -88,6 +88,18 @@ F-Lab이 "분산 락 → Kafka"로 이어지는 파이프라인을 설계한 것
 
 **완료 기준**: `k6 run` → Grafana 대시보드에서 실시간 TPS/P99/에러율 확인 가능
 
+**공통 벤치마크 규약** (모든 트랙의 Before/After 측정에 적용)
+
+| 항목 | 규약 | 이유 |
+|------|------|------|
+| Warm-up | 측정 전 30초 warm-up 구간, 결과에서 제외 | JIT 컴파일, 커넥션 풀 초기화 노이즈 제거 |
+| 측정 시간 | 최소 60초 sustained load | 짧은 burst는 GC, rebalancing 등 실제 부하 특성 반영 못함 |
+| 반복 | 동일 조건 3회 실행, 중앙값 사용 | 단발 측정은 노이즈에 취약 |
+| 데이터셋 | 트랙별 고정 seed 데이터 (크기 명시) | 데이터 양에 따라 DB 성능이 달라짐 |
+| 환경 스펙 | docker-compose 리소스 제한값 명시 (CPU/Memory) | "내 맥북에서 돌린 숫자"에 재현 가능성 부여 |
+| 성공 기준 | 에러율 < 1%, P99 < 목표값 | 높은 TPS지만 에러율 10%면 무의미 |
+| 기록 | LEARNING-LOG.md에 환경 + 조건 + 수치 + 스크린샷 | 면접에서 "어떤 환경에서 측정했나요?" 대응 |
+
 **연결**: `projects/infra/docker-compose.yml`, `projects/infra/k6/load-test.js`
 
 ---
@@ -102,16 +114,16 @@ F-Lab이 "분산 락 → Kafka"로 이어지는 파이프라인을 설계한 것
 
 **당해보기 실험**
 ```
-실험 1: 락 없이 100 스레드가 동시에 같은 계좌에서 출금
-  → 기대: 잔액 불일치 발생
-  → 측정: 최종 잔액 vs 기대 잔액의 차이
+실험 1: 락 없이 100 스레드가 동시에 같은 토큰을 갱신
+  → 기대: 갱신 값 덮어쓰기 발생 (lost update)
+  → 측정: 최종 토큰 값이 마지막 유효 갱신과 불일치하는 횟수
 
 실험 2: synchronized로 보호
   → 기대: 단일 서버에서는 정합성 보장
   → 측정: TPS 변화 (락 오버헤드)
 
 실험 3: 2개 서버 인스턴스에서 synchronized 사용
-  → 기대: 다시 데이터 불일치 발생 (JVM 락의 한계)
+  → 기대: 다시 덮어쓰기 발생 (JVM 락은 프로세스 내부만 보호)
   → 측정: 분산 환경에서 synchronized가 무력화되는 것을 실측으로 증명
 ```
 
@@ -210,7 +222,7 @@ Consumer 재시작 시 메시지가 유실되거나 중복 처리되는 문제.
 > auto-commit에서 Consumer를 강제 종료하면 메시지가 유실되는 것을 직접 실험으로 확인했고,
 > Manual Commit + Idempotent Consumer 조합을 선택했습니다.
 > Exactly-once는 Kafka Streams 의존성과 외부 DB 원자성 보장 불가 때문에 배제했고,
-> At-least-once + 멱등성으로 실질적 Exactly-once를 달성했습니다.
+> At-least-once + 멱등성 조합으로 비즈니스 레벨에서 중복 없는 처리를 확보했습니다.
 > Consumer Lag 모니터링은 Grafana 대시보드로 파티션별 추적합니다."
 
 **연결 문서**
@@ -319,7 +331,7 @@ L1(인메모리) + L2(Redis) 2계층 캐시 운영 경험.
 - [ ] 토스의 이중 Circuit Breaker: Istio(인프라) + Resilience4j(앱) 조합
 
 **구현 목표**
-- platform-api: Resilience4j CircuitBreaker + Retry + RateLimiter + Bulkhead
+- platform-api: Resilience4j CircuitBreaker + Bulkhead (실험 범위에 맞춤)
 - WireMock 기반 장애 시뮬레이션 테스트
 - CircuitBreaker 상태 전환 메트릭 → Grafana
 
@@ -340,7 +352,7 @@ L1(인메모리) + L2(Redis) 2계층 캐시 운영 경험.
 > 너무 민감하면 정상 트래픽도 차단되는 트레이드오프를 확인했습니다."
 
 **연결 문서**
-- [depth-guide §5: 분산 시스템](docs/interview-prep/depth-guide.md) (Circuit Breaker 섹션 추가 필요)
+- [depth-guide §5: 분산 시스템](docs/interview-prep/depth-guide.md)
 - [Episode #5: 서킷 브레이커](EXPERIENCE-STORIES.md)
 
 ---
@@ -360,8 +372,8 @@ DB 저장 후 Kafka 발행 전에 크래시가 나면 이벤트가 유실된다.
   → 측정: DB에는 저장됨, Kafka에는 메시지 없음 (유실 증명)
 
 실험 2: 같은 코드에서 @Transactional로 묶기 시도
-  → 기대: Kafka는 DB 트랜잭션에 참여 못함 (2PC가 아닌 이상)
-  → 측정: 동일하게 유실 발생
+  → 기대: @Transactional은 DB만 관리 — Kafka 발행은 트랜잭션 경계 밖
+  → 측정: 동일하게 유실 발생 (DB-Kafka 간 원자적 경계 부재 확인)
 
 실험 3: Transactional Outbox 적용
   → DB 저장 + Outbox 테이블 저장 (같은 트랜잭션)
@@ -398,7 +410,8 @@ DB 저장 후 Kafka 발행 전에 크래시가 나면 이벤트가 유실된다.
 
 **면접 스토리**
 > "DB에 저장했는데 Kafka 발행이 안 되는 상황을 실험으로 재현했습니다.
-> @Transactional로 묶어도 Kafka는 DB 트랜잭션에 참여하지 않아서 유실이 발생했고,
+> @Transactional로 묶어도 DB와 Kafka 사이에 원자적 경계가 없어 유실이 발생했고,
+> (Spring Kafka Transaction도 외부 DB와의 end-to-end 원자성은 보장하지 못합니다)
 > Transactional Outbox Pattern으로 해결했습니다.
 > CDC(Debezium) 대신 폴링을 선택한 이유는 인프라 복잡도 대비 5초 지연이 우리 도메인에서 허용 가능했기 때문이고,
 > 이 판단 기준은 ADR-005에 기록했습니다.
@@ -411,16 +424,135 @@ DB 저장 후 Kafka 발행 전에 크래시가 나면 이벤트가 유실된다.
 
 ---
 
-## 프로젝트 ↔ 트랙 매핑
+## Repo 구조 — 3개 독립 포트폴리오
 
-| 프로젝트 | 적용 트랙 | 핵심 구현 |
-|---------|----------|---------|
-| **platform-api** (Java) | Track 0, 1, 3, 4, 5 | 분산 락, 2계층 캐시, Circuit Breaker, Outbox |
-| **platform-event-consumer** (Kotlin) | Track 0, 2, 5 | Manual Commit, Idempotent Consumer, DLQ |
-| **async-crawler** (Kotlin) | Track 0, 4 | Structured Concurrency, Circuit Breaker, Rate Limiting |
+각 Repo는 독립적으로 clone → `docker-compose up` → 실험 재현이 가능해야 한다.
+이 문서(portfolio-docs)는 설계 허브로, 각 Repo의 전략/ADR/면접 준비를 관리한다.
 
-프로젝트 상세 설계는 [projects/README.md](projects/README.md) 참고.
-언어 선택 근거(Java + Kotlin 혼합)도 해당 문서에 기록.
+### Repo 1: `concurrency-cache-lab` (Track 1 + 3)
+
+**도메인**: 선착순 쿠폰 발급 / 재고 차감 시스템
+
+**왜 묶는가**: Track 3의 Cache Stampede 방지가 Track 1의 분산 락을 직접 사용 (기술 의존성)
+
+| 포함 트랙 | 핵심 구현 |
+|----------|---------|
+| Track 0 (측정) | docker-compose, k6, Grafana — 이 Repo 전용 인프라 |
+| Track 1 (동시성) | synchronized → DB FOR UPDATE → Redis SET NX → Redisson 4단계 비교 |
+| Track 3 (캐시) | 캐시 없음 → @Cacheable → Stampede 재현 → 분산 락 → L1+L2 4단계 비교 |
+
+**기술 스택**: Java 17+ / Spring Boot 3.x / Redis / Redisson / Caffeine / MySQL / k6 / Grafana
+
+**면접 스토리**: 분산 락 선택 과정 + Cache Stampede 해결 과정 (2개)
+
+**연결 ADR**: ADR-003 (Cache 전략), ADR-004 (분산 락 구현 방식)
+
+**이슈 구조 (12개)**
+
+```
+Phase A: 인프라 + 기준선
+  #1  프로젝트 셋업 (Spring Boot 3.x + Java 17 skeleton)
+  #2  인프라 셋업 (docker-compose: MySQL, Redis, Prometheus, Grafana, k6)
+  #3  기준선 측정 + 실험 템플릿 (Hello API baseline + 메트릭 정의 + 실험 기록 템플릿)
+
+Phase B: Track 1 — 동시성 & 분산 락
+  #4  실험 1: 락 없이 100 스레드 토큰 갱신 → lost update 증명
+  #5  실험 2-3: synchronized (단일 서버 정합성 → 2 인스턴스 무력화)
+  #6  DB FOR UPDATE 락 → 커넥션 병목 측정
+  #7  Redisson 분산 락 구현 (watchdog, 재진입)
+  #8  Track 1 종합: 락 방식별 Before/After 비교표
+
+Phase C: Track 3 — 캐시 & Stampede
+  #9  실험 1-2: 캐시 없이 부하 → @Cacheable → Stampede 재현   ← #3 이후 시작 가능
+  #10 Stampede 해결: 분산 락 + Double-Check Locking            ← #7, #9 의존
+  #11 L1+L2 2계층 캐시 (Caffeine + Redis)
+  #12 Track 3 종합: 캐시 전략별 Before/After 비교표
+```
+
+**의존성 그래프**
+
+```
+#1 → #2 → #3
+              ├→ #4 → #5 → #6 → #7 → #8
+              │                   ↓
+              └→ #9 ──→ #10 ←────┘
+                         ↓
+                        #11 → #12
+```
+
+---
+
+### Repo 2: `kafka-outbox-pipeline` (Track 2 + 5)
+
+**도메인**: 주문 생성 → 이벤트 발행 → 소비 파이프라인
+
+**왜 묶는가**: Track 5의 Outbox가 Track 2의 Kafka를 발행 대상으로 사용 (기술 의존성)
+
+| 포함 트랙 | 핵심 구현 |
+|----------|---------|
+| Track 0 (측정) | docker-compose, Consumer Lag 모니터링 (Prometheus + Grafana) |
+| Track 2 (Kafka) | auto-commit + kill → manual commit → Idempotent Consumer → Rebalancing |
+| Track 5 (Outbox) | 직접 발행 유실 → @Transactional 시도 → Outbox + 폴링 Relay → Relay 경합 |
+
+**기술 스택**: Kotlin / Spring Boot 3.x / Spring Kafka / Testcontainers / MySQL / k6 / Grafana
+
+**면접 스토리**: 메시지 유실 해결 과정 + Outbox 도입 근거 (2개)
+
+**연결 ADR**: ADR-001 (Kafka vs RabbitMQ), ADR-002 (Coroutines vs Virtual Threads), ADR-005 (Outbox Relay)
+
+---
+
+### Repo 3: `resilience-patterns-lab` (Track 4)
+
+**도메인**: 복수 외부 API 연동 서비스 (결제 API, 배송 API, 알림 API 등)
+
+**단독 Repo인 이유**: 다른 트랙과 기술 의존성 없음 + 복원력 패턴 종류만으로 충분한 깊이
+
+| 포함 트랙 | 핵심 구현 |
+|----------|---------|
+| Track 0 (측정) | docker-compose, CircuitBreaker 상태 메트릭 (Prometheus + Grafana) |
+| Track 4 (복원력) | CB 없이 장애 전파 → Circuit Breaker → Bulkhead → Retry → Rate Limiting |
+
+**기술 스택**: Kotlin / Spring Boot 3.x / Resilience4j / WireMock / Coroutines / k6 / Grafana
+
+**면접 스토리**: Circuit Breaker 설정값 근거를 실험으로 도출한 과정 (1개, 깊게)
+
+**연결 ADR**: ADR-002 (Coroutines vs Virtual Threads)
+
+---
+
+### 각 Repo 공통 구조
+
+```
+repo-name/
+├── README.md              ← Before/After 비교표, 실험 요약
+├── docs/
+│   ├── experiments/       ← 단계별 실험 기록 (가설→결과→발견)
+│   └── deep-dive/         ← CS 원리 정리 (면접 대비)
+├── infra/
+│   ├── docker-compose.yml ← 해당 Repo에 필요한 인프라만
+│   └── k6/                ← 부하 테스트 스크립트
+├── src/                   ← 구현 코드
+└── results/               ← 실측 그래프, Grafana 스크린샷
+```
+
+### Repo ↔ 트랙 매핑 요약
+
+| Repo | 적용 트랙 | 도메인 | 면접 스토리 |
+|------|----------|--------|-----------|
+| **concurrency-cache-lab** | Track 0, 1, 3 | 쿠폰/재고 동시성 | 분산 락 + Stampede |
+| **kafka-outbox-pipeline** | Track 0, 2, 5 | 주문 이벤트 파이프라인 | 메시지 유실 + Outbox |
+| **resilience-patterns-lab** | Track 0, 4 | 외부 API 연동 | Circuit Breaker |
+
+### 진행 순서
+
+```
+Repo 1 (concurrency-cache-lab)     ← 가장 먼저. 동시성은 모든 백엔드의 기본
+    ↓
+Repo 2 (kafka-outbox-pipeline)     ← Kafka + 이벤트. 분산 시스템 확장
+    ↓
+Repo 3 (resilience-patterns-lab)   ← 복원력. 운영 관점 마무리
+```
 
 ---
 
@@ -429,6 +561,7 @@ DB 저장 후 Kafka 발행 전에 크래시가 나면 이벤트가 유실된다.
 | 문서 | 역할 | 상태 |
 |------|------|------|
 | **STRATEGY.md** (이 문서) | 딥다이브 트랙 전략의 본체 | 현행 |
+| [ROADMAP.md](ROADMAP.md) | 실행 순서. Repo별 이슈, 트레이드오프, AI 대화 가이드 | 현행 |
 | [STRATEGY-V2.md](STRATEGY-V2.md) | 10개사 JD 분석 + 기술 블로그 깊이 분석. 참고 아카이브 | 아카이브 |
 | [EXPERIENCE-STORIES.md](EXPERIENCE-STORIES.md) | 실무 경험 7개 에피소드. 트랙의 "실무 문제" 소스 | 유지 |
 | [LEARNING-LOG.md](LEARNING-LOG.md) | 트랙별 실험 일지. "당해보기"의 기록 | 실험 형식으로 재구조화 |
@@ -474,4 +607,4 @@ Closes #이슈번호
 ---
 
 _이 문서는 포트폴리오 진행에 따라 지속적으로 업데이트한다._
-_마지막 업데이트: 2026-04-14 (F-Lab 딥다이브 트랙 철학 기반 전면 개정)_
+_마지막 업데이트: 2026-04-14 (3-Repo 독립 포트폴리오 구조로 전환)_

@@ -8,7 +8,10 @@
 ## 이 저장소의 목적
 
 한국 빅테크(네이버, 카카오, 토스, 쿠팡, 당근마켓) 백엔드 포트폴리오의 **설계 문서 허브**입니다.
-실제 구현 코드는 각 서비스 저장소(platform-api, platform-event-consumer, async-crawler)에 있습니다.
+실제 구현 코드는 3개 독립 Repo에 있습니다:
+- `concurrency-cache-lab` — 동시성 & 캐시 (Track 1+3)
+- `kafka-outbox-pipeline` — 메시징 & 이벤트 (Track 2+5)
+- `resilience-patterns-lab` — 장애 격리 & 복원력 (Track 4)
 
 **핵심 철학**: "당해보기 → 측정 → 딥다이브 → 해결 → 증거 → 스토리"
 기술을 먼저 도입하지 않는다. 기술이 없을 때의 문제를 먼저 체감하고, Before/After 수치로 증명한다.
@@ -21,7 +24,8 @@
 portfolio-docs/
 ├── README.md               ← 포트폴리오 전체 소개 (공개 얼굴)
 ├── CLAUDE.md               ← 지금 읽고 있는 파일. AI 협업 규칙
-├── STRATEGY.md             ← Deep Dive Track 전략 (6개 트랙 정의)
+├── STRATEGY.md             ← Deep Dive Track 전략 (6개 트랙 + 3-Repo 구조)
+├── ROADMAP.md              ← 실행 순서 (Repo별 이슈, 트레이드오프, AI 대화 가이드)
 ├── LEARNING-LOG.md         ← 실험 일지 (가설 → 실험 → 결과 → 발견)
 ├── EXPERIENCE-STORIES.md   ← 실무 경험 7개 에피소드
 ├── STRATEGY-V2.md          ← 10개사 JD 분석 (아카이브)
@@ -118,19 +122,16 @@ AI가 코드를 작성하거나 실험을 도와주면, 다음을 LEARNING-LOG.m
 
 ## 현재 프로젝트 상태 (2026-04-14)
 
-### Deep Dive Track 진행 상태
+### Repo별 진행 상태
 
-| Track | 주제 | 상태 | 다음 할 일 |
-|:-----:|------|:----:|-----------|
-| 0 | 측정 기반 구축 | 🔜 | docker-compose 완성 + k6 기준선 측정 |
-| 1 | 동시성 & 분산 락 | 🔜 | platform-api 스켈레톤 → 락 없이 동시성 실험 |
-| 2 | Kafka & 메시지 안정성 | 🔜 | auto-commit + kill 실험 |
-| 3 | 캐시 & Stampede | 🔜 | Track 1 완료 후 |
-| 4 | 장애 격리 & 복원력 | 🔜 | WireMock 장애 시뮬레이션 |
-| 5 | 이벤트 드리븐 & Outbox | 🔜 | Track 2 완료 후 |
+| Repo | 트랙 | 상태 | 다음 할 일 |
+|------|------|:----:|-----------|
+| **concurrency-cache-lab** | Track 1+3 | 🔜 | Repo 생성 → 인프라 셋업 → 락 없이 동시성 실험 |
+| **kafka-outbox-pipeline** | Track 2+5 | 🔜 | Repo 1 이후. auto-commit + kill 실험 |
+| **resilience-patterns-lab** | Track 4 | 🔜 | Repo 2 이후. WireMock 장애 시뮬레이션 |
 
 ### 완료된 문서
-- [x] STRATEGY.md — Deep Dive Track 전략 (6개 트랙)
+- [x] STRATEGY.md — Deep Dive Track 전략 (6개 트랙) + 3-Repo 구조
 - [x] ADR-001~005 (Kafka, Coroutines, Cache, 분산 락, Outbox)
 - [x] EXPERIENCE-STORIES.md (실무 7개 에피소드)
 - [x] depth-guide.md (꼬리질문 4단계 방어)
@@ -138,11 +139,11 @@ AI가 코드를 작성하거나 실험을 도와주면, 다음을 LEARNING-LOG.m
 - [x] STRATEGY-V2.md (10개사 JD 분석)
 
 ### 다음 액션
-- [ ] Track 0: `docker-compose up -d` → 모든 서비스 healthy 확인
-- [ ] Track 0: k6 기준선 측정
-- [ ] Track 1: platform-api Spring Boot 스켈레톤 생성
-- [ ] Track 1: 락 없이 100 스레드 동시성 실험 → LEARNING-LOG 기록
-- [ ] Track 2: Testcontainers 기반 Kafka 통합 테스트
+- [ ] Repo 1 (`concurrency-cache-lab`): GitHub Repo 생성 + Spring Boot 스켈레톤
+- [ ] Repo 1: docker-compose (Redis, MySQL, Prometheus, Grafana, k6) 셋업
+- [ ] Repo 1: 락 없이 100 스레드 동시성 실험 → experiments/ 기록
+- [ ] Repo 1: k6 기준선 측정
+- [ ] Repo 2 (`kafka-outbox-pipeline`): Repo 1 Track 1 완료 후 시작
 
 ---
 

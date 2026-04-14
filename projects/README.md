@@ -1,5 +1,17 @@
 # 포트폴리오 프로젝트 목록
 
+> **아카이브 (2026-04-14):**
+> 이 문서는 초기 3-서비스 구조(platform-api, platform-event-consumer, async-crawler) 기준으로 작성되었다.
+> 현재는 **3-Repo 독립 포트폴리오 구조**로 전환됨. 최신 구조는 [STRATEGY.md](../STRATEGY.md)의 "Repo 구조" 섹션 참고.
+>
+> | 현재 Repo | 트랙 | 도메인 |
+> |----------|------|--------|
+> | `concurrency-cache-lab` | Track 1+3 | 쿠폰/재고 동시성 |
+> | `kafka-outbox-pipeline` | Track 2+5 | 주문 이벤트 파이프라인 |
+> | `resilience-patterns-lab` | Track 4 | 외부 API 연동 |
+>
+> 아래 내용은 초기 서비스 설계 참고용으로 보존한다. 언어 선택 근거, 실무 문제 매핑은 여전히 유효.
+
 각 프로젝트는 독립적인 GitHub 리포지토리로 공개한다.
 회사 코드(TypeScript/Python)는 공개하지 않으며, **실제 운영에서 겪은 문제 패턴을 재설계한 것**임을 명시한다.
 

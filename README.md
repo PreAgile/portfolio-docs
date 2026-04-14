@@ -16,9 +16,10 @@
 ## 읽는 순서
 
 ```
-① STRATEGY.md          ← 왜, 어떻게. 6개 Deep Dive Track 전략
-② LEARNING-LOG.md      ← 실험 증거. 가설 → 실험 → 결과 → 발견
-③ docs/adr/            ← 기술 결정 근거 (Kafka, Cache, 분산 락, Outbox)
+① STRATEGY.md          ← 왜, 어떻게. 6개 Deep Dive Track 전략 + 3-Repo 구조
+② ROADMAP.md           ← 실행 순서. Repo별 이슈, 트레이드오프, AI 대화 가이드
+③ LEARNING-LOG.md      ← 실험 증거. 가설 → 실험 → 결과 → 발견
+④ docs/adr/            ← 기술 결정 근거 (Kafka, Cache, 분산 락, Outbox)
 ```
 
 실무 경험과 면접 준비가 궁금하면:
@@ -59,34 +60,33 @@
 
 ---
 
-## 시스템 아키텍처
+## 포트폴리오 Repo 구조
+
+3개 독립 Repo + 이 설계 허브. 각 Repo는 독립적으로 clone → 실험 재현 가능.
 
 ```
-                         [platform-api] ★ Java 17+
-                         ┌────────────────────────────────────────┐
-   사용자 요청 ─────────▶│  Spring Boot 3.x + Java                │
-                         │                                        │
-                         │  Track 1: Redisson 분산 락              │
-                         │  Track 3: Caffeine(L1) + Redis(L2)     │
-                         │  Track 4: Resilience4j CircuitBreaker  │
-                         │  Track 5: Transactional Outbox          │
-                         └──────────┬─────────────────────────────┘
-                                    │ Kafka (Outbox Relay)
-                                    ▼
-                         [platform-event-consumer] ★ Kotlin
-                         ┌────────────────────────────────────────┐
-                         │  Spring Kafka + Kotlin Coroutine       │
-                         │                                        │
-                         │  Track 2: Manual Commit + Idempotent   │
-                         │  Track 2: Dead Letter Topic            │
-                         │  Track 0: Prometheus + Grafana          │
-                         └────────────────────────────────────────┘
-
-  [async-crawler] ★ Kotlin ────────────────▶ platform-api
-   Track 4: Coroutine + CircuitBreaker + Rate Limiting
+portfolio-docs (이 저장소)          ← 설계 허브: 전략, ADR, 면접 준비
+    │
+    ├── concurrency-cache-lab      ← Repo 1: 동시성 & 캐시 (Track 1+3)
+    │   도메인: 선착순 쿠폰/재고 차감
+    │   Java 17+ / Redisson / Caffeine+Redis / k6
+    │
+    ├── kafka-outbox-pipeline      ← Repo 2: 메시징 & 이벤트 (Track 2+5)
+    │   도메인: 주문 이벤트 파이프라인
+    │   Kotlin / Spring Kafka / Outbox / Testcontainers
+    │
+    └── resilience-patterns-lab    ← Repo 3: 장애 격리 & 복원력 (Track 4)
+        도메인: 외부 API 연동 서비스
+        Kotlin / Resilience4j / WireMock / Coroutines
 ```
 
-프로젝트 상세: [projects/README.md](projects/README.md)
+| Repo | 트랙 | 면접 스토리 |
+|------|------|-----------|
+| **concurrency-cache-lab** | Track 0, 1, 3 | 분산 락 4단계 비교 + Cache Stampede 해결 |
+| **kafka-outbox-pipeline** | Track 0, 2, 5 | 메시지 유실 해결 + Outbox 도입 근거 |
+| **resilience-patterns-lab** | Track 0, 4 | Circuit Breaker 설정값을 실험으로 도출 |
+
+각 Repo 상세 전략: [STRATEGY.md](STRATEGY.md)
 
 ---
 
