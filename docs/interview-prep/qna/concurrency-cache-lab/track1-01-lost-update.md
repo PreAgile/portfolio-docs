@@ -1187,6 +1187,94 @@ Dirty Checking의 비용이 이득을 넘는 상황:
 >
 > 하나의 `@Transactional` 범위 내에서 같은 ID로 `findById`를 두 번 부르면 두 번째는 DB를 안 가고 1차 캐시에서 바로 반환됩니다. **DB 격리 수준의 REPEATABLE READ와는 다른 메커니즘**이고, 애플리케이션 관점에서 같은 트랜잭션 내 동일 객체를 반복 참조하는 효과를 냅니다. 실험에서는 각 스레드가 **독립된 트랜잭션 = 독립된 Persistence Context**라서 1차 캐시가 공유되지 않고, 각자 DB에서 따로 SELECT합니다."
 
+### [꼬리질문] "그 동일 객체 보장이 실무에서 구체적으로 왜 이득인가요?"
+
+**L4 심화 — 동일성(Identity) 보장의 실전 가치**
+
+> "두 가지 실전 이득이 있습니다. **같은 트랜잭션 내 자기 Lost Update 방지**와 **서비스 레이어 분리 시 쓰기 일관성**입니다."
+
+#### (1) 동일성 vs 동등성 — 무엇이 보장되나
+
+```java
+@Transactional
+public void demo(Long id) {
+    ReplyRequest a = replyRepo.findById(id);  // DB SELECT → 객체 A 생성
+    ReplyRequest b = replyRepo.findById(id);  // 1차 캐시 HIT → 객체 A 그대로 반환
+
+    System.out.println(a == b);         // true (동일성: 같은 메모리 주소)
+    System.out.println(a.equals(b));    // true (동등성)
+
+    a.markProcessing();                  // a.retryCount = 1
+    System.out.println(b.getRetryCount());  // 1 (a와 b는 같은 객체!)
+}
+```
+
+> **JPA는 `==`(동일성)까지 보장**합니다. 일반적인 ORM/JDBC는 `.equals()`(동등성)만 보장하거나 아무것도 보장하지 않습니다.
+
+#### (2) 1차 캐시가 없으면 같은 트랜잭션 안에서도 Lost Update가 난다
+
+```java
+// 1차 캐시 없는 JDBC 스타일
+@Transactional
+public void noCacheScenario(Long id) {
+    ReplyRequest a = jdbcSelect(id);   // 새 객체 A (retryCount=0)
+    ReplyRequest b = jdbcSelect(id);   // 새 객체 B (retryCount=0, 별개 인스턴스)
+
+    a.setLocked(true);                  // A만 바뀜
+    b.markProcessing();                 // B만 바뀜 (locked는 여전히 false)
+
+    jdbcUpdate(a);   // UPDATE SET locked=true, retryCount=0
+    jdbcUpdate(b);   // UPDATE SET locked=false, retryCount=1  ← A의 locked 변경이 사라짐!
+}
+```
+
+> **같은 트랜잭션 내에서 자기 자신을 Lost Update** 하는 황당한 버그가 JDBC에선 흔합니다. JPA는 같은 객체를 공유하니까 구조적으로 방지됩니다.
+
+#### (3) 서비스 레이어가 나뉘어도 변경이 누적된다
+
+```java
+@Transactional
+public void processReplyFully(Long id) {
+    validationService.validate(id);      // 내부 findById(id) → 같은 객체 반환
+    lockService.markLocked(id);          // 내부 findById(id) → 같은 객체, setLocked(true)
+    scraperClient.register(id);
+    completionService.markCompleted(id); // 내부 findById(id) → 같은 객체, markCompleted()
+}
+```
+
+| | 1차 캐시 없음 | 1차 캐시 있음 (JPA) |
+|---|---|---|
+| **DB SELECT 횟수** | 4회 | **1회** |
+| **자바 객체 개수** | 4개 (별개) | **1개 (공유)** |
+| **변경 누적 방식** | 각자 다른 객체를 수정 → 충돌 | 같은 객체에 누적 → 일관 |
+| **UPDATE 발행** | 4번 (마지막 값이 이김) | **1번** (모든 변경 통합) |
+
+> **핵심**: 서비스 분리를 해도 엔티티 수정의 최종 결과가 **원자적으로 하나의 UPDATE**에 담깁니다.
+
+#### (4) 영속성 컨텍스트 범위 — '애플리케이션 레벨 Repeatable Read'
+
+```java
+@Transactional
+public void appLevelRepeatableRead(Long id) {
+    ReplyRequest r1 = replyRepo.findById(id);
+    // → 여기서 다른 트랜잭션이 DB의 retry_count를 999로 바꾸고 커밋했다고 가정
+
+    ReplyRequest r2 = replyRepo.findById(id);
+    // → 여전히 1차 캐시에서 반환, retry_count는 원래 값 그대로
+}
+```
+
+| | DB `REPEATABLE READ` | JPA 1차 캐시 |
+|---|---|---|
+| **동작 레이어** | DB 엔진 (MVCC + undo log) | 애플리케이션 메모리 (Map) |
+| **보장하는 것** | 같은 SELECT 쿼리 결과의 일관성 | 같은 ID 조회의 **객체 인스턴스 동일성** |
+| **DB 조회 횟수** | 매번 DB 호출 | 첫 1번만 DB, 이후 캐시 |
+| **범위** | 트랜잭션 전체 | 영속성 컨텍스트(세션) 전체 |
+
+#### (5) 정리 — 면접에서 답하는 한 문단
+
+> "JPA는 같은 영속성 컨텍스트 안에서 같은 ID 조회 시 **항상 같은 자바 객체 인스턴스**를 반환합니다. `==` 비교까지 true라서 서비스 레이어가 여러 메서드로 나뉘어 같은 엔티티를 다뤄도 **모든 변경이 하나의 객체에 누적**되고, 트랜잭션 종료 시 **하나의 UPDATE로 통합 반영**됩니다. JDBC로 직접 쓰면 같은 ID 조회가 매번 새 객체를 반환해서 같은 트랜잭션 안에서도 자기 자신과 Lost Update가 날 수 있는데, JPA는 1차 캐시로 이를 구조적으로 방지합니다. 이건 DB 격리 수준의 REPEATABLE READ와는 다른 **애플리케이션 레벨의 일관성**입니다."
+
 ---
 
 ## Q2. 격리 수준과 InnoDB 락
