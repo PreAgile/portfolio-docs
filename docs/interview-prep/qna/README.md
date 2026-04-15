@@ -69,7 +69,7 @@ qna/
 | **Optimistic vs Pessimistic Lock** | [track1-01-lost-update.md](concurrency-cache-lab/track1-01-lost-update.md) |
 | **외부 API 이중 호출 / 멱등성** | [track1-01-lost-update.md](concurrency-cache-lab/track1-01-lost-update.md) |
 | **Two Generals' Problem** | [track1-01-lost-update.md](concurrency-cache-lab/track1-01-lost-update.md) |
-| **RabbitMQ at-least-once + Dedup** | [track1-01-lost-update.md](concurrency-cache-lab/track1-01-lost-update.md) |
+| **Long-running HTTP + 재시도 경합** | [track1-01-lost-update.md](concurrency-cache-lab/track1-01-lost-update.md) |
 | synchronized 한계 (예정) | track1-02 |
 | SELECT FOR UPDATE (예정) | track1-03 |
 | Redisson watchdog (예정) | track1-04 |
