@@ -20,13 +20,13 @@ Track 1(동시성)의 Lost Update 실험으로 **"JPA + 락"의 정합성 문제
 
 ## 5개 실험 로드맵
 
-| # | 실험 | 난이도 | 선행 레퍼런스 | Phase |
-|:-:|------|:-:|----|:-:|
-| **DC-1** | `@Transactional(readOnly=true)` 효과 | 쉬움 | 카카오페이 + Vlad Mihalcea | 1 |
-| **DC-4** | JDBC vs JPA 자기 Lost Update | 쉬움 | Vlad Mihalcea (1차 캐시) | 2 |
-| **DC-5** | 서비스 레이어 SELECT/UPDATE 단일화 | 중간 | 일반 JPA 패턴 | 3 |
-| **DC-2** | `@DynamicUpdate` 트레이드오프 | 중간 | Thorben Janssen / Baeldung | 4 |
-| **DC-3** | Bytecode Enhancement 벤치마크 | 어려움 | Vlad Mihalcea (벤치마크) | 5 |
+| # | 이슈 | 실험 | 난이도 | 선행 레퍼런스 | Phase |
+|:-:|:-:|------|:-:|----|:-:|
+| **DC-1** | [#13](https://github.com/PreAgile/concurrency-cache-lab/issues/13) | `@Transactional(readOnly=true)` 효과 | 쉬움 | 카카오페이 + Vlad Mihalcea | 1 |
+| **DC-4** | [#16](https://github.com/PreAgile/concurrency-cache-lab/issues/16) | JDBC vs JPA 자기 Lost Update | 쉬움 | Vlad Mihalcea (1차 캐시) | 2 |
+| **DC-5** | [#17](https://github.com/PreAgile/concurrency-cache-lab/issues/17) | 서비스 레이어 SELECT/UPDATE 단일화 | 중간 | 일반 JPA 패턴 | 3 |
+| **DC-2** | [#14](https://github.com/PreAgile/concurrency-cache-lab/issues/14) | `@DynamicUpdate` 트레이드오프 | 중간 | Thorben Janssen / Baeldung | 4 |
+| **DC-3** | [#15](https://github.com/PreAgile/concurrency-cache-lab/issues/15) | Bytecode Enhancement 벤치마크 | 어려움 | Vlad Mihalcea (벤치마크) | 5 |
 
 **진행 순서 근거**:
 - 쉬운 것부터 난이도 상승
