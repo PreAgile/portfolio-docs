@@ -525,6 +525,390 @@ Q2에서도 말했듯, **DB 현재 상태 검증은 Dirty Checking이 아니라 
 
 </details>
 
+<details>
+<summary><b>🔍 깊게 파기 #6 — 코드단에서 Dirty Checking 동작을 실제로 관측하는 7가지 방법</b></summary>
+
+이론만 아는 게 아니라 **"직접 눈으로 확인했다"**를 보여주려면 이 방법들을 쓸 수 있어야 합니다.
+
+### 6-A. SQL 레벨 로깅 (가장 기초)
+
+`application.yml`:
+```yaml
+logging:
+  level:
+    org.hibernate.SQL: DEBUG                              # UPDATE/INSERT SQL 출력
+    org.hibernate.orm.jdbc.bind: TRACE                    # 파라미터 바인딩 값 (6.x)
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE  # 5.x 버전
+spring:
+  jpa:
+    properties:
+      hibernate:
+        format_sql: true
+        use_sql_comments: true   # SQL에 주석으로 호출 위치 표시
+```
+
+**확인할 수 있는 것**:
+- Dirty 필드만 바뀌었는데 모든 컬럼이 UPDATE에 들어가는지 (`@DynamicUpdate` 없을 때)
+- 스냅샷 비교 후 변경 없으면 UPDATE 자체가 발생하지 않는지
+- `@Version` 걸었을 때 WHERE 절에 `version = ?`가 붙는지
+
+**한계**: Hibernate가 생성한 최종 SQL만 보여줌. "왜 이 SQL이 생성됐는지"는 모름.
+
+### 6-B. Hibernate Statistics (로드/업데이트 카운트)
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        generate_statistics: true
+```
+
+```java
+@Autowired
+private EntityManagerFactory emf;
+
+void printStats() {
+    Statistics stats = emf.unwrap(SessionFactory.class).getStatistics();
+    System.out.println("Entity loads: " + stats.getEntityLoadCount());
+    System.out.println("Entity updates: " + stats.getEntityUpdateCount());
+    System.out.println("Flushes: " + stats.getFlushCount());
+    EntityStatistics es = stats.getEntityStatistics("com.lemong.lab.domain.reply.ReplyRequest");
+    System.out.println("ReplyRequest updates: " + es.getUpdateCount());
+}
+```
+
+**활용**: 로직이 "엔티티 1개를 1번 업데이트했는지, 모르게 N번 업데이트 했는지" 검증.
+
+### 6-C. Hibernate Interceptor로 dirty 필드 실시간 관찰
+
+```java
+@Component
+public class DirtyCheckLoggingInterceptor implements Interceptor {
+
+    @Override
+    public boolean onFlushDirty(Object entity, Object id,
+                                Object[] currentState, Object[] previousState,
+                                String[] propertyNames, Type[] types) {
+        List<String> dirty = new ArrayList<>();
+        for (int i = 0; i < propertyNames.length; i++) {
+            if (!Objects.equals(currentState[i], previousState[i])) {
+                dirty.add(propertyNames[i]
+                    + ": " + previousState[i] + " → " + currentState[i]);
+            }
+        }
+        log.info("[DIRTY] {} id={} changes={}",
+            entity.getClass().getSimpleName(), id, dirty);
+        return false;  // Hibernate의 기본 dirty 계산을 그대로 사용
+    }
+}
+```
+
+**Spring Boot 등록**:
+```yaml
+spring.jpa.properties.hibernate.session_factory.interceptor: com.lemong.lab.DirtyCheckLoggingInterceptor
+```
+
+**확인할 수 있는 것**:
+- `currentState` = 현재 엔티티 필드값
+- `previousState` = 로드 시점 스냅샷
+- **둘의 실제 내용을 직접 출력**해서 Dirty Checking 매커니즘을 눈으로 검증
+
+### 6-D. JPA EntityListener / Callback
+
+Interceptor보다 가볍고 엔티티 단위로 적용 가능:
+
+```java
+@Entity
+@EntityListeners(ReplyRequestAuditListener.class)
+public class ReplyRequest { ... }
+
+public class ReplyRequestAuditListener {
+    @PreUpdate
+    public void beforeUpdate(ReplyRequest r) {
+        log.info("[@PreUpdate] id={} retryCount={} status={}",
+            r.getId(), r.getRetryCount(), r.getRequestStatus());
+    }
+}
+```
+
+**한계**: `previousState`가 안 보이고 현재 상태만 보임. 스냅샷 비교는 못 함.
+
+### 6-E. 디버거 breakpoint로 Persistence Context 내부 들여다보기
+
+IntelliJ나 VSCode에서:
+
+1. `DefaultFlushEntityEventListener#dirtyCheck(FlushEntityEvent)` 에 breakpoint
+2. Expression Evaluator로:
+   ```
+   event.getPropertyValues()                   // currentState
+   event.getEntityEntry().getLoadedState()     // 스냅샷
+   event.getSession().getPersistenceContext()
+        .getEntry(event.getEntity()).getLoadedState()
+   ```
+3. 두 배열을 나란히 놓고 필드별 비교
+
+**직접 확인 가능한 것**:
+- 스냅샷 배열이 실제로 `Object[]`로 들어있는지
+- `@Version` 필드가 스냅샷에 포함되어 있는지
+- flush 시점에 어떤 엔티티들이 managed 상태로 남아있는지
+
+### 6-F. Bytecode Enhancement 적용 여부 확인 (javap)
+
+```bash
+# 1. 엔티티 컴파일 후
+javap -c -p build/classes/java/main/com/lemong/lab/domain/reply/ReplyRequest.class
+```
+
+Enhancement가 적용됐다면 다음과 같은 **주입된 메서드**가 보입니다:
+
+```
+public void $$_hibernate_trackChange(java.lang.String);
+public boolean $$_hibernate_hasDirtyAttributes();
+public java.lang.String[] $$_hibernate_getDirtyAttributes();
+public void $$_hibernate_clearDirtyAttributes();
+```
+
+인터페이스 구현 확인:
+```bash
+javap -p ReplyRequest.class | grep implements
+# implements org.hibernate.engine.spi.PersistentAttributeInterceptable, ...
+```
+
+**없으면 Enhancement 미적용 → 기본 스냅샷 비교 경로 사용 중**.
+
+### 6-G. p6spy / datasource-proxy로 실제 실행된 SQL 캡처
+
+Hibernate가 생성한 SQL과 실제 DB에 보낸 SQL이 다를 수 있음 (prepared statement 재사용 등). 100% 확실한 검증은 JDBC 레이어에서:
+
+```yaml
+# build.gradle
+implementation 'com.github.gavlyukovskiy:p6spy-spring-boot-starter:1.9.0'
+
+# application.yml
+decorator:
+  datasource:
+    p6spy:
+      enable-logging: true
+      multiline: true
+```
+
+**실제 DB에 도달한 SQL + 실행 시간 + 파라미터 실값**까지 모두 로그에 남음. Hibernate 내부 로그와 비교하면 추상화 계층 간 간극 확인 가능.
+
+### 6-H. Testcontainers로 Lost Update 직접 재현 (이 실험의 방식)
+
+```java
+@SpringBootTest
+@Testcontainers
+class LostUpdateReproductionTest {
+    @Container
+    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.0");
+
+    @Test
+    void 동시_100_스레드가_retry_count를_증가시킨다() {
+        // ExecutorService + CountDownLatch로 100개 동시 호출
+        // 최종 retry_count < 100 검증
+    }
+}
+```
+
+**장점**: CI에서도 재현 가능, 팀 전체가 '사고 재현 자산'으로 공유.
+
+### 실전 팁 — 어떤 걸 어디서 쓰나
+
+| 상황 | 추천 도구 |
+|------|-----------|
+| "이 엔티티가 왜 UPDATE 되지?" | **Interceptor + 디버거** |
+| "전체 시스템의 UPDATE 빈도가 이상하다" | **Hibernate Statistics + Grafana** |
+| "운영에서 가끔 이상한 UPDATE가 나간다" | **p6spy 로그 + Interceptor 감사 기록** |
+| "코드 변경 후 Dirty 검출이 바뀌었는지 확인" | **Testcontainers 재현 테스트** |
+| "Enhancement가 정말 켜졌나?" | **javap + `$$_hibernate_` 메서드 확인** |
+
+</details>
+
+<details>
+<summary><b>🔍 깊게 파기 #7 — 국내/해외 빅테크는 이 문제를 어떻게 풀었나 (공개 사례)</b></summary>
+
+### 🇰🇷 국내 빅테크
+
+#### 1. 우아한형제들 — "WMS 재고 이관을 위한 분산 락 사용기" (2025)
+
+**문제**:
+- 배민 WMS(창고 관리 시스템)에서 재고 "할당"과 "취소"가 동시에 들어오면 재고 수량이 깨짐
+- 여러 인스턴스의 API 서버가 같은 재고 row를 동시 수정
+
+**해결**:
+- **이관요청서 단위의 분산 락 키** 설계
+- 할당/취소 모두 동일한 락 키 사용 → 직렬화
+- 락은 Redis 기반 (자세한 구현은 블로그 참조)
+
+**교훈**: "락 키 설계는 기능 단위가 아니라 **경합이 발생하는 엔티티 단위**로 해야 한다." 할당과 취소가 서로 다른 키를 쓰면 락이 의미 없음.
+
+출처: https://techblog.woowahan.com/17416/
+
+#### 2. 우아한형제들 — "MySQL을 이용한 분산락으로 여러 서버에 걸친 동시성 관리"
+
+**문제**:
+- 광고 시스템에서 여러 서버가 같은 광고 캠페인을 동시 처리
+- Redis/ZooKeeper 같은 추가 인프라 도입 없이 해결하고 싶음
+
+**해결**:
+- **MySQL `GET_LOCK()`, `RELEASE_LOCK()`** 네이티브 함수 사용
+- 기존 RDBMS만으로 분산 락 구현
+- 세션 단위 락이라 커넥션이 끊기면 자동 해제
+
+**교훈**: "이미 가진 인프라로 풀 수 있다면 그 선택이 운영 비용 최저." 다만 MySQL 락은 Redis 대비 성능 낮음(수천 TPS) → 트래픽 규모에 맞춰 판단.
+
+출처: https://techblog.woowahan.com/2631/
+
+#### 3. 컬리(Kurly) — "풀필먼트 입고 서비스팀에서 분산락을 사용하는 방법 - Spring Redisson"
+
+**문제**:
+- 입고 처리 시 여러 작업자가 동일 상품에 대한 처리를 동시 수행
+- 재고 정합성이 깨지면 잘못된 발주/입고 발생
+
+**해결**:
+- **Redisson `RLock` + Spring AOP**로 메서드 레벨 분산 락 구현
+- `@DistributedLock(key = "#productId")` 같은 어노테이션 설계
+- Watchdog으로 long-running 작업 중 TTL 자동 연장
+
+**교훈**: 분산 락을 **AOP로 추상화**해서 비즈니스 코드에서는 어노테이션만 붙이면 되게 설계. 팀 전체의 러닝커브 낮춤.
+
+출처: https://helloworld.kurly.com/blog/distributed-redisson-lock/
+
+#### 4. 토스증권 — SLASH 22 "애플 한 주가 고객에게 전달되기까지"
+
+**문제**:
+- 주식 주문 시 사용자 자산 차감/보유 수량 변경이 동시 다발적으로 발생
+- **단 1원도 틀리면 안 되는** 금융 시스템
+
+**해결** (공개된 내용):
+- **분산 락**으로 동시성 제어 (1차 방어)
+- **JPA `@OptimisticLocking` (`@Version`)** 으로 갱신 분실 감지 (2차 방어)
+- 이 둘을 **CAS(Compare-And-Swap) 연산 패턴**으로 결합
+- 락으로 충돌 자체를 줄이고, 혹시 샌 경우 낙관적 락이 예외로 잡음
+
+**교훈**: "금융은 방어선이 하나면 안 된다." 단일 락에만 의존하면 Redis 장애 시 즉시 사고. **이중/삼중 방어** 필수.
+
+출처: https://toss.im/slash-22 (SLASH 22 컨퍼런스)
+
+#### 5. 카카오페이 기술 블로그 (tech.kakaopay.com)
+
+결제/정산 시스템의 멱등성 관련 글들이 여러 편 공개되어 있고, 공통된 패턴은:
+- **idempotency key 기반 중복 결제 방지**
+- **분산 락 + DB 유니크 제약**의 이중 방어
+- 실패/성공 상태 머신 관리
+
+출처: https://tech.kakaopay.com/
+
+---
+
+### 🌍 해외 빅테크
+
+#### 1. Stripe — "Designing robust and predictable APIs with idempotency" (2017)
+
+**문제**:
+- 결제 API 호출이 네트워크 오류로 타임아웃 → 클라이언트는 재시도해야 하는데, 이미 결제된 건지 알 수 없음
+- 재시도 시 **중복 결제 위험**
+
+**해결**:
+- 클라이언트가 생성한 **Idempotency Key (UUID)** 를 `Idempotency-Key` 헤더로 전송
+- 서버는 **(key, 요청 본문 해시, 응답) 튜플을 24시간 저장**
+- 같은 key로 재시도 시 캐시된 응답을 그대로 반환
+- 처음 요청이 "진행 중"이면 409 Conflict로 응답해 클라이언트가 대기하게 함
+
+**교훈**: **"멱등성은 서버 책임이지만, 키 생성은 클라이언트 책임."** 클라이언트가 재시도마다 같은 키를 보내야 의미가 있고, 이를 위해 SDK가 자동으로 UUID를 생성해줘야 함.
+
+출처: https://stripe.com/blog/idempotency
+
+#### 2. Airbnb — "Avoiding Double Payments in a Distributed Payments System"
+
+**문제**:
+- 게스트가 예약 결제 → 호스트에게 정산 → 외부 은행 API 호출
+- 중간에 **어느 한 단계라도 재시도되면 이중 결제/이중 정산** 발생 가능
+
+**해결**:
+- 자체 라이브러리 **"Orpheus"** 개발
+- 모든 요청을 **pre-RPC, RPC, post-RPC 3단계**로 분리
+- 각 단계마다 **idempotency key + DB row-level lock** 획득
+- RPC 응답이 DB에 기록될 때까지 락 유지 → 중간 실패해도 다음 재시도가 정확히 재개
+
+**교훈**: "네트워크 호출을 3단계로 쪼개면 각 단계를 독립적으로 멱등하게 만들 수 있다." 단일 메서드 내에 RPC를 숨기면 재시도가 정확히 어디서 중단됐는지 모름.
+
+출처: https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb
+
+#### 3. Shopify — "Surviving Flashes of High-Write Traffic"
+
+**문제**:
+- Black Friday 같은 플래시 세일에 **초당 수만 건의 쓰기 트래픽** 발생
+- 같은 상품에 재고 차감이 동시에 들어오면 오버셀 위험
+
+**해결**:
+- **Pod 아키텍처**: 샵 단위로 DB를 샤딩해 독립된 pod으로 격리
+- **Scriptable Load Balancer + Leaky Bucket**: 엣지에서 초당 요청 수 제한
+- DB 레벨에선 **재고 차감에 명시적 락** (공개된 세부 구현은 DB SELECT FOR UPDATE 기반)
+
+**교훈**: "락만으로는 절대 못 막는다." 락은 DB까지 도달한 요청을 직렬화할 뿐, **트래픽 자체를 엣지에서 걸러야** 시스템이 산다.
+
+출처: https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-i
+
+#### 4. Uber — "Real-Time Exactly-Once Event Processing with Flink, Kafka, Pinot"
+
+**문제**:
+- 광고 이벤트 처리에서 **절대 누락/중복 없이** 최소 지연으로 결과 발행 필요
+- 분산 스트림 처리에서 exactly-once 보장
+
+**해결**:
+- **Kafka + Flink의 exactly-once semantics** 활용
+- **Pinot의 upsert 연산**으로 중복 레코드 자동 병합
+- 각 레코드에 **unique record identifier** 부여 → 중복 제거와 멱등성 동시 보장
+
+**교훈**: "exactly-once delivery는 불가능하지만 exactly-once processing은 가능하다." 핵심은 **멱등한 쓰기 연산(upsert)** + **고유 식별자**.
+
+출처: https://www.infoq.com/news/2021/11/exactly-once-uber-flink-kafka/
+
+#### 5. Martin Kleppmann — "How to do distributed locking" (Redlock 비판)
+
+**문제 제기**:
+- Redis의 **Redlock 알고리즘**이 "분산 락의 표준"처럼 받아들여지는데, 정말 안전한가?
+
+**핵심 지적**:
+1. **GC pause 동안 락이 만료되면** 원래 소유자가 락을 놓은 줄 모르고 작업을 계속함 → 다른 클라이언트가 획득 → 이중 처리
+2. **시계 동기화(NTP)에 의존**하는 설계 — NTP 점프나 시스템 시간 조작 시 락 타이밍 깨짐
+3. **네트워크 지연**이 TTL을 초과하면 이미 만료된 락으로 작업 계속
+
+**해결 제안**:
+- **Fencing Token**: 락 획득 시 단조 증가 토큰 발급 → DB UPDATE 시 `WHERE token > last_known_token` 조건으로 "오래된 요청 차단"
+- 또는 **ZooKeeper/etcd 같은 합의 기반** 분산 락 사용 (성능은 느리지만 안전)
+
+**교훈**: **"분산 락은 '효율을 위한 최선의 노력(best effort)'이지 '정확성 보장'이 아니다."** 정합성이 절대적이면 fencing 또는 consensus 기반.
+
+출처: https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+
+---
+
+### 📌 사례들을 관통하는 공통 패턴
+
+공개된 모든 사례를 종합하면 **"같은 5가지 방어선"** 의 조합입니다:
+
+| 방어선 | 목적 | 대표 사례 |
+|--------|------|----------|
+| **1. Edge Throttling** | DB 도달 전 트래픽 제한 | Shopify leaky bucket |
+| **2. Idempotency Key** | 중복 요청을 클라이언트에서 식별 | Stripe, Airbnb |
+| **3. 분산 락** | 동시 진입 자체 차단 | 우아한형제들, 토스, 컬리 |
+| **4. DB 레벨 락 / Optimistic Lock** | 마지막 쓰기 단계의 정합성 검증 | 토스 (CAS), Airbnb (row lock) |
+| **5. 사후 Reconciliation / Idempotency Table** | 중복 발생 시 사후 감지/복구 | Airbnb Orpheus, Stripe 스토리지 |
+
+**이 실험(이슈 #4)은 (3)과 (4)의 필요성을 증명**하는 것이고, 실제 운영에서는 (1), (2), (5)도 함께 조합되어야 **진짜 안전한 시스템**이 됩니다.
+
+### 🎤 면접 활용 포인트
+
+> "저희 시스템의 Redis SETNX 기반 락은 Shopify, 우아한형제들, 컬리 등의 공개 사례와 같은 계열입니다. 다만 Kleppmann의 RedLock 비판을 읽고 fencing token을 검토했는데, 저희 워크로드에서는 '외부 API 재확인 + DLQ'가 더 실용적 방어선이라 판단해 도입하지 않았습니다. 금융급 정합성이 필요하면 토스증권처럼 분산 락 + @Version CAS 패턴을, 외부 결제라면 Stripe/Airbnb처럼 idempotency key 레이어를 추가하는 게 맞습니다."
+
+이 한 문단으로 **"이론 → 공개 사례 → 본인 판단"**의 3단 논리를 보여줄 수 있습니다.
+
+</details>
+
 ---
 
 ### [꼬리질문] "1차 캐시는 어떤 자료구조로 되어있나요?"
