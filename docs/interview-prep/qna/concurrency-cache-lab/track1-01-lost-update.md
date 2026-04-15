@@ -151,6 +151,382 @@ T1: COMMIT  (DB=1)
 >
 > `@DynamicUpdate`를 쓰면 변경된 필드만 UPDATE에 포함하고, `@Version`을 쓰면 WHERE 절에 version 조건이 추가돼서 '내가 읽은 버전에서 안 바뀌었다'를 DB에 검증합니다. 단, 이건 Hibernate가 SQL WHERE를 바꾸는 방식이지 dirty checking 자체를 바꾸는 건 아닙니다."
 
+---
+
+<details>
+<summary><b>🔍 깊게 파기 #1 — 스냅샷은 언제, 어디서, 어떻게 찍히는가</b></summary>
+
+### 1-A. 스냅샷이 찍히는 시점 (load)
+
+`findById`, JPQL 조회, 연관 엔티티 fetch 등 **엔티티가 Persistence Context에 "managed" 상태로 올라가는 모든 경로**에서 스냅샷이 찍힙니다.
+
+흐름:
+
+```
+EntityManager.find(id)
+  ↓
+Session.get(entityClass, id)
+  ↓
+DefaultLoadEventListener.onLoad(LoadEvent)
+  ↓
+EntityPersister.load(id, ...) → ResultSet → hydrate
+  ↓
+TwoPhaseLoad.postHydrate(...)
+  ↓
+TwoPhaseLoad.initializeEntity(...)
+  ↓
+PersistenceContext.addEntity(entityKey, entity)
+PersistenceContext.addEntry(entity, EntityEntry(
+    loadedState = Object[]{ field1_value, field2_value, ... },  ← 스냅샷
+    status = MANAGED,
+    ...
+))
+```
+
+**핵심**: 스냅샷(`loadedState`)은 **DB에서 읽은 값을 `Type.deepCopy()`로 복제한 배열**입니다. 참조가 아닌 값 복제라서 엔티티 객체가 나중에 변경돼도 스냅샷은 원래 값을 보존합니다.
+
+### 1-B. 스냅샷이 비교되는 시점 (flush)
+
+**자동 flush가 트리거되는 상황** (5가지):
+
+1. `@Transactional` 메서드 종료 직전 (commit 전)
+2. 명시적 `entityManager.flush()` 호출
+3. JPQL 쿼리 실행 직전 (FlushModeType이 AUTO일 때, pending UPDATE가 쿼리 결과에 영향을 줄 수 있으니까)
+4. Native Query 실행 직전 (`flushMode = ALWAYS`일 때)
+5. Session.close() 직전 (주의: close 시점 자동 flush는 설정에 따라 다름)
+
+**flush 내부 흐름**:
+
+```
+session.flush() / 트랜잭션 commit
+  ↓
+AbstractFlushingEventListener.flushEverythingToExecutions(FlushEvent)
+  ↓
+flushEntities(event, persistenceContext)
+  ↓
+for each managed entity:
+    DefaultFlushEntityEventListener.onFlushEntity(FlushEntityEvent)
+      ↓
+    isUpdateNecessary(event)
+      ↓
+    dirtyCheck(FlushEntityEvent)  ← 여기서 비교 시작
+      ↓
+    int[] dirtyProperties =
+        interceptor.findDirty(entity, id, currentState, loadedState, ...)
+        // interceptor가 null/UNKNOWN 반환하면 ↓
+        persister.findDirty(currentState, loadedState, entity, session)
+          ↓
+        for each property:
+            Type.isDirty(loadedState[i], currentState[i], checkable[i], session)
+              // 타입별로 비교:
+              //   BasicType: Objects.equals()
+              //   EntityType: id 비교
+              //   CollectionType: 별도 로직
+```
+
+비교 결과 `dirtyProperties`가 빈 배열이 아니면 UPDATE SQL 생성 + executions 큐에 적재 → flush 마지막에 일괄 전송.
+
+### 1-C. 왜 "스냅샷 배열"이라는 비싸 보이는 구조를 쓸까?
+
+**설계 의도**:
+1. **자동 변경 추적**: 개발자가 `save()`를 명시적으로 호출하지 않아도 setter만 호출하면 변경이 DB에 반영됨 (DX 향상)
+2. **변경된 필드만 UPDATE 가능** (`@DynamicUpdate`와 조합)
+3. **Interceptor/Listener 훅 제공**: `Interceptor.onFlushDirty()`로 감사 로그, 이벤트 발행 등에 활용
+
+**대가**:
+- 로드한 모든 엔티티마다 `Object[]` 1개를 메모리에 보관 → 대량 조회 시 메모리 압박
+- flush 시 O(필드 수 × 엔티티 수)의 비교 연산
+
+→ 이 비용을 줄이려고 나온 게 **Bytecode Enhancement의 dirty tracking** (아래 토글)
+
+</details>
+
+<details>
+<summary><b>🔍 깊게 파기 #2 — Hibernate 실제 코드 경로 (클래스/메서드 매핑)</b></summary>
+
+> Hibernate ORM 6.x 기준. 5.x도 경로 대부분 동일하지만 패키지/이름 일부 다름.
+
+| 단계 | 클래스 | 메서드 | 역할 |
+|------|--------|--------|------|
+| 1 | `DefaultLoadEventListener` | `onLoad(LoadEvent)` | 로드 이벤트 진입점 |
+| 2 | `TwoPhaseLoad` | `initializeEntity()` | 엔티티 초기화 + PC 등록 |
+| 3 | `StatefulPersistenceContext` | `addEntry(entity, status, loadedState, ...)` | **스냅샷 배열 저장** |
+| 4 | `EntityEntry` | `loadedState` 필드 | 로드 시점 값 배열 보관 |
+| 5 | `DefaultFlushEventListener` | `onFlush(FlushEvent)` | flush 이벤트 진입점 |
+| 6 | `AbstractFlushingEventListener` | `flushEverythingToExecutions()` | flush 전체 오케스트레이션 |
+| 7 | `DefaultFlushEntityEventListener` | `onFlushEntity(FlushEntityEvent)` | 엔티티별 flush 처리 |
+| 8 | `DefaultFlushEntityEventListener` | `isUpdateNecessary()` | **dirty 계산 진입점** |
+| 9 | `EntityPersister` (인터페이스) | `findDirty(current, loaded, entity, session)` | 필드별 비교 위임 |
+| 10 | `AbstractEntityPersister` (구현) | `findDirty()` → `TypeHelper.findDirty()` | 실제 비교 |
+| 11 | `Type` 구현체들 | `isDirty(old, current, checkable, session)` | 타입별 dirty 판정 |
+
+**찾아보기 좋은 시작점** (한 메서드만 본다면):
+- `DefaultFlushEntityEventListener#dirtyCheck(FlushEntityEvent event)` — dirty 계산의 핵심 로직
+- `AbstractEntityPersister#findDirty(...)` — 실제 필드 비교 루프
+
+**버전별 위치 차이**:
+- 5.x: `org.hibernate.event.internal.*`
+- 6.x: 패키지는 동일하지만 `Type` 계층 일부가 `org.hibernate.type.descriptor.java.*`, `JavaType` 기반으로 리팩터링됨
+
+실제 IntelliJ에서 Hibernate 소스를 열려면:
+```
+1. build.gradle에서 hibernate-core 버전 확인
+2. External Libraries > hibernate-core-*.jar
+3. 위 클래스명으로 찾기 (Cmd+Shift+O)
+```
+
+</details>
+
+<details>
+<summary><b>🔍 깊게 파기 #3 — Bytecode Enhancement란 무엇인가</b></summary>
+
+### 3-A. 정의
+
+**Hibernate가 컴파일 타임(또는 로드 타임)에 엔티티 클래스의 바이트코드를 조작**해서 필드 접근/변경을 가로채는 기능. Java 소스는 그대로지만, `.class` 파일이 Hibernate가 주입한 코드로 변형됨.
+
+### 3-B. 활성화 방법
+
+**Gradle**:
+```groovy
+plugins {
+    id 'org.hibernate.orm' version '6.x.x'
+}
+
+hibernate {
+    enhancement {
+        enableLazyInitialization = true     // @LazyToOne 실 동작
+        enableDirtyTracking = true          // SelfDirtinessTracker 주입
+        enableAssociationManagement = true  // 양방향 연관 자동 동기화
+    }
+}
+```
+
+**Maven**: `hibernate-enhance-maven-plugin`으로 동일 옵션 설정.
+
+### 3-C. Bytecode Enhancement의 3대 기능
+
+#### (1) Lazy Initialization (for basic fields / @LazyGroup)
+
+일반적으로 Hibernate의 LAZY는 **연관 엔티티**에만 적용됩니다(`@ManyToOne(fetch = LAZY)` 등). **기본 필드(BLOB, TEXT 같은 큰 컬럼)는 항상 EAGER**입니다.
+
+Bytecode Enhancement를 켜면 기본 필드에도 `@Basic(fetch = LAZY)`를 붙일 수 있게 되고, 해당 필드 getter 호출 시점에 별도 SELECT를 날리도록 바이트코드에 hook이 주입됩니다.
+
+#### (2) Dirty Tracking — 이게 이번 주제의 핵심
+
+**기본 (Enhancement 없음)**:
+- 엔티티 로드 시 `Object[] loadedState` 스냅샷 복제
+- flush 시 현재 필드값 vs 스냅샷 전체 비교 → O(N) 비교
+
+**Enhancement 있음**:
+- 엔티티 클래스가 `SelfDirtinessTracker` 인터페이스를 구현하도록 바이트코드 변환
+- 모든 setter에 "이 필드가 바뀌었음"을 기록하는 코드 주입
+- flush 시 "바뀐 필드 이름 목록"만 바로 읽음 → **스냅샷 비교 생략**
+
+변환 전후 개념적 이미지:
+
+```java
+// 원본 코드
+@Entity
+public class ReplyRequest {
+    private int retryCount;
+    public void setRetryCount(int v) { this.retryCount = v; }
+}
+
+// Enhancement 후 (개념적 의사 바이트코드)
+@Entity
+public class ReplyRequest implements SelfDirtinessTracker {
+    private int retryCount;
+    private transient Set<String> $$_hibernate_tracker;
+
+    public void setRetryCount(int v) {
+        if ($$_hibernate_tracker != null && this.retryCount != v) {
+            $$_hibernate_tracker.add("retryCount");  // ← 주입된 코드
+        }
+        this.retryCount = v;
+    }
+
+    @Override
+    public String[] $$_hibernate_getDirtyAttributes() {
+        return $$_hibernate_tracker.toArray(new String[0]);
+    }
+}
+```
+
+**장점**:
+- 스냅샷 `Object[]`를 안 만들어도 됨 → 메모리 절약 (엔티티가 10만 개면 절감 크고)
+- flush 시 비교 루프 생략 → 속도 향상
+- "정말로 바뀐 필드"만 추적돼서 `@DynamicUpdate`의 효과 극대화
+
+**비용**:
+- 빌드 단계에 추가 작업
+- 디버깅 시 바이트코드 변형이 있어 혼란 가능
+- 실수로 Enhancement 플러그인이 빠지면 동작이 조용히 바뀜
+
+### 3-D. Dirty Checking의 두 경로 (요약)
+
+| 경로 | Enhancement | 스냅샷 생성 | flush 비교 |
+|------|:---:|---|---|
+| **기본** | ✗ | `Object[] loadedState` 배열 복제 | 필드별 `Type.isDirty()` 전체 비교 |
+| **Enhanced** | ✓ | 불필요 (tracker만 있음) | tracker의 dirty 필드 목록 바로 읽음 |
+
+실험의 `concurrency-cache-lab`은 Enhancement를 켜지 않은 상태라 **기본 경로**로 동작합니다. 그래서 Q1 본문의 설명은 기본 경로 기준.
+
+</details>
+
+<details>
+<summary><b>🔍 깊게 파기 #4 — @LazyToOne / Dirty Tracking 어노테이션 정리</b></summary>
+
+### 4-A. `@LazyToOne` — OneToOne 진짜 LAZY 동작
+
+```java
+@Entity
+public class ReplyRequest {
+    @OneToOne(fetch = FetchType.LAZY)
+    @LazyToOne(LazyToOneOption.NO_PROXY)
+    private Review review;
+}
+```
+
+**문제의 본질**: JPA의 `@OneToOne(fetch = LAZY)`는 **대부분 작동하지 않고 EAGER처럼 동작**합니다.
+
+**이유**: `review`가 null인지 객체인지 판단하려면 어차피 DB를 읽어야 함. 프록시를 만들 수는 있지만 `review == null` 체크가 true/false로 정확히 나오려면 실제 로딩이 필요.
+
+**해결**: Bytecode Enhancement + `@LazyToOne(LazyToOneOption.NO_PROXY)`
+- 소유 측 엔티티의 `review` 필드에 접근할 때마다 Enhancement 코드가 가로채서 **그 시점에만 DB fetch**
+- 프록시 없이 진짜 지연 로딩
+
+### 4-B. `@DynamicUpdate` vs Dirty Tracking 관계
+
+```java
+@Entity
+@DynamicUpdate
+public class ReplyRequest { ... }
+```
+
+| 기능 | 역할 |
+|------|------|
+| **Dirty Tracking** | "어떤 필드가 바뀌었는가?"를 감지 (런타임 동작) |
+| **@DynamicUpdate** | 감지된 dirty 필드만 UPDATE 문에 포함 (SQL 생성) |
+
+둘은 **독립적**:
+- `@DynamicUpdate` 없음 + Enhancement 없음: 모든 필드로 `UPDATE` 생성, 쿼리 캐시 잘 됨
+- `@DynamicUpdate` 있음 + Enhancement 없음: dirty 필드만 포함, 매번 다른 SQL (statement cache miss)
+- Enhancement 있음: 위 둘의 감지 방식만 달라짐, 생성되는 SQL은 `@DynamicUpdate` 여부에 따라 결정
+
+### 4-C. `@Version` — 낙관적 락
+
+Dirty Tracking과는 **완전히 별개의 축**:
+
+```sql
+-- @Version 있을 때 Hibernate가 생성
+UPDATE reply_requests
+SET retry_count = ?, version = ?
+WHERE id = ? AND version = ?  ← 이 조건으로 충돌 감지
+```
+
+- Dirty Tracking: "애플리케이션 메모리에서 바뀐 필드가 있는가?"
+- `@Version`: "내가 읽은 버전과 DB 현재 버전이 같은가?"
+
+Q2에서도 말했듯, **DB 현재 상태 검증은 Dirty Checking이 아니라 `@Version`의 WHERE 조건**으로 이뤄집니다.
+
+</details>
+
+<details>
+<summary><b>🔍 깊게 파기 #5 — "DB 현재 상태를 참조하지 않는다" 아키텍처 그림</b></summary>
+
+### 5-A. 두 트랜잭션 × 두 Persistence Context × 하나의 DB
+
+```
+                         ┌───────────────────────────────┐
+                         │         MySQL (InnoDB)        │
+                         │  ┌─────────────────────────┐  │
+                         │  │ reply_requests.id=1     │  │
+                         │  │ retry_count = 0         │  │
+                         │  └─────────────────────────┘  │
+                         └─────────┬─────────────┬───────┘
+                                   │             │
+                        SELECT ────┘             └──── SELECT
+                        (MVCC)                       (MVCC)
+                           │                            │
+                           ▼                            ▼
+     ┌────────────────────────────┐    ┌────────────────────────────┐
+     │   Thread T1                │    │   Thread T2                │
+     │   Transaction T1           │    │   Transaction T2           │
+     │                            │    │                            │
+     │  Persistence Context #1    │    │  Persistence Context #2    │
+     │  ┌──────────────────────┐  │    │  ┌──────────────────────┐  │
+     │  │ managed entity:       │  │    │  │ managed entity:       │  │
+     │  │   retry_count = 0     │  │    │  │   retry_count = 0     │  │
+     │  │                       │  │    │  │                       │  │
+     │  │ EntityEntry:          │  │    │  │ EntityEntry:          │  │
+     │  │   loadedState[        │  │    │  │   loadedState[        │  │
+     │  │     retry_count: 0    │  │    │  │     retry_count: 0    │  │
+     │  │   ]  ◄── 스냅샷        │  │    │  │   ]  ◄── 스냅샷        │  │
+     │  └──────────────────────┘  │    │  └──────────────────────┘  │
+     │                            │    │                            │
+     │  markProcessing():         │    │  markProcessing():         │
+     │    retry_count = 1         │    │    retry_count = 1         │
+     │                            │    │                            │
+     │  [flush]                   │    │  [flush]                   │
+     │  dirty check:              │    │  dirty check:              │
+     │    current(1) vs snap(0)   │    │    current(1) vs snap(0)   │
+     │    → DIRTY                 │    │    → DIRTY                 │
+     │  UPDATE retry_count = 1    │    │  UPDATE retry_count = 1    │
+     └────────┬───────────────────┘    └───────────────────┬───────┘
+              │                                            │
+              │  각자 자기 스냅샷만 보고 UPDATE 생성          │
+              │  DB의 현재 값은 확인하지 않음                 │
+              ▼                                            ▼
+                         ┌───────────────────────────────┐
+                         │         MySQL (InnoDB)        │
+                         │                               │
+                         │  T1 UPDATE → X-lock 획득       │
+                         │   retry_count = 1              │
+                         │  T1 COMMIT                     │
+                         │   ── DB 값: 1 ──               │
+                         │                               │
+                         │  T2 UPDATE → T1 대기 후 획득    │
+                         │   retry_count = 1 (덮어씀)     │
+                         │  T2 COMMIT                     │
+                         │   ── DB 값: 1 (Lost!) ──      │
+                         └───────────────────────────────┘
+```
+
+### 5-B. 핵심 세 가지 단절
+
+```
+[단절 1] T1과 T2의 Persistence Context는 서로 완전히 분리
+  → T1이 변경한 엔티티를 T2가 공유하지 않음
+  → 각자 자기 스냅샷 따로 가짐
+
+[단절 2] 스냅샷은 "로드 시점"의 값, DB의 "현재" 값이 아님
+  → T2의 스냅샷은 0으로 고정
+  → T1이 DB를 1로 바꾼 후에도 T2의 스냅샷은 여전히 0
+
+[단절 3] UPDATE는 "값으로 써라"이지 "값으로 증가시켜라"가 아님
+  → T2의 UPDATE는 "retry_count = 1" (절대값)
+  → DB가 이미 1이어도 다시 1로 덮어씀
+  → 만약 UPDATE가 "retry_count = retry_count + 1"이었으면 Lost Update 없음
+```
+
+### 5-C. 이 그림이 왜 중요한가
+
+이 세 단절을 이해하면 **모든 락 전략의 동작 원리가 명확해집니다**:
+
+| 전략 | 어느 단절을 메우는가? |
+|------|---------------------|
+| **@Version (낙관적)** | [단절 2] — UPDATE의 WHERE에 `version = ?`을 추가해 스냅샷 유효성을 DB에 검증 |
+| **SELECT FOR UPDATE (비관적)** | [단절 1] — 읽는 순간 X-lock으로 다른 트랜잭션이 읽지도 못하게 함 |
+| **SERIALIZABLE** | [단절 1, 2] — 읽기까지 락 범위에 포함 |
+| **분산 락 (Redis)** | [단절 1] — DB 밖에서 동시 진입 자체를 막음 |
+| **UPDATE ... SET x = x + 1** | [단절 3] — 절대값이 아닌 상대 연산으로 바꿔 DB가 현재 값 기준으로 계산 |
+
+이 매핑을 답할 수 있으면 "그 락은 왜 효과가 있나?"에 대한 **메커니즘 수준의 이해**를 보여줄 수 있습니다.
+
+</details>
+
+---
+
 ### [꼬리질문] "1차 캐시는 어떤 자료구조로 되어있나요?"
 
 **L4 심화**
