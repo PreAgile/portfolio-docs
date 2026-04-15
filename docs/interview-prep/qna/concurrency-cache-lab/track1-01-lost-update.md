@@ -139,6 +139,70 @@ T1: COMMIT  (DB=1)
 
 > **핵심**: Dirty Checking은 "내가 읽은 시점 기준 객체가 변경되었는가?"만 봅니다. **DB 현재 상태를 재확인하지 않습니다.**
 
+### [꼬리질문] "그럼 한 트랜잭션이 DB를 실제로 언제 읽고 언제 쓰나요? flush 시점에도 다시 읽나요?"
+
+**L3 — 타이밍 답변**
+
+> "한 트랜잭션 생명주기에서 DB 접근은 **`findById`에서 SELECT 1번 + flush에서 UPDATE 1번**이 전부입니다. flush 시점에는 **DB를 다시 읽지 않습니다**."
+
+```
+@Transactional 메서드 진입
+│
+├─[T=0]── Persistence Context 생성 (비어 있음)
+│
+├─[T=1]── repo.findById(1L) 호출
+│         │
+│         ├─ 1차 캐시 확인 → 없음
+│         ├─ SELECT * FROM reply_requests WHERE id=1   ← ★ DB 조회 (처음이자 마지막)
+│         ├─ 결과를 엔티티로 변환(hydrate) + managed 상태로 저장
+│         └─ loadedState 스냅샷 복제: Object[]{0, "PENDING", ...}
+│
+├─[T=2]── entity.markProcessing() 실행
+│         │
+│         ├─ this.retryCount = 1  (자바 객체 필드만 변경)
+│         └─ DB에는 아무 일도 안 일어남
+│
+└─[T=3]── 메서드 종료 → @Transactional 커밋 직전
+          │
+          ├─ flush() 자동 호출
+          │   ├─ loadedState vs current 필드별 비교 → Dirty!
+          │   └─ UPDATE ... SET retry_count=1 WHERE id=1   ← ★ DB 쓰기만, 읽기 X
+          │
+          └─ COMMIT
+```
+
+**여러 스레드가 동시에 들어올 때**: 각 스레드는 **완전히 독립된 트랜잭션 + Persistence Context + 스냅샷**을 가집니다. 공유되는 건 DB뿐.
+
+```
+시간축 (ms)
+ ├─0.010  T1: SELECT → retry_count=0, 스냅샷#1 = 0
+ ├─0.011  T2: SELECT → retry_count=0, 스냅샷#2 = 0   ← T1이 아직 커밋 안 했으니 0
+ ├─0.012  T3: SELECT → retry_count=0, 스냅샷#3 = 0   ← 같은 0
+ │        ... (수십 개 스레드가 모두 0 읽음)
+ │
+ ├─0.030  T1: flush → UPDATE SET retry_count=1
+ ├─0.031  T1: COMMIT                              (DB = 1)
+ │
+ ├─0.032  T2: flush → UPDATE SET retry_count=1    ← T1 대기 후 획득, 자기 스냅샷(0) 기준
+ ├─0.033  T2: COMMIT                              (DB = 1, 덮어씀 → Lost!)
+ │
+ ├─0.034  T3: flush → UPDATE SET retry_count=1
+ └─0.035  T3: COMMIT                              (또 덮어씀)
+```
+
+**시나리오별 DB 접근 횟수 정리**:
+
+| 패턴 | SELECT | UPDATE | 결과 |
+|------|:---:|:---:|------|
+| 단일 스레드 1회 | 1 | 1 | 정상 |
+| 100 스레드 순차 | 100 | 100 | 정상 |
+| 100 스레드 동시 (현재 실험) | 100 | 100 | **88 Lost** |
+| 100 + `@Version` | 100 | ~13 성공 + ~87 예외 | 정합성 OK, 재시도 필요 |
+| 100 + `FOR UPDATE` | 100 (순차화) | 100 | 정합성 OK, 느림 |
+| 100 + 분산 락 | 1 (첫 스레드만) | 1 | 99개는 락에 막혀 조기 반환 |
+
+> 면접에서의 한 줄: **"flush는 쓰기 전용이고, 스냅샷은 로드 시점 값으로 고정됩니다. 각 트랜잭션이 자기만의 스냅샷 기준으로 UPDATE를 내보내기 때문에 여러 트랜잭션이 같은 시점의 DB를 읽으면 결과적으로 같은 새 값으로 서로를 덮어씁니다."**
+
 ### [꼬리질문] "그럼 Dirty Checking은 정확히 어떻게 구현되어 있나요? Hibernate 내부에서."
 
 **L4 — CS 심화 (시니어 방어선)**
@@ -939,6 +1003,177 @@ class LostUpdateReproductionTest {
 > "저희 시스템의 Redis SETNX 기반 락은 Shopify, 우아한형제들, 컬리 등의 공개 사례와 같은 계열입니다. 다만 Kleppmann의 RedLock 비판을 읽고 fencing token을 검토했는데, 저희 워크로드에서는 '외부 API 재확인 + DLQ'가 더 실용적 방어선이라 판단해 도입하지 않았습니다. 금융급 정합성이 필요하면 토스증권처럼 분산 락 + @Version CAS 패턴을, 외부 결제라면 Stripe/Airbnb처럼 idempotency key 레이어를 추가하는 게 맞습니다."
 
 이 한 문단으로 **"이론 → 공개 사례 → 본인 판단"**의 3단 논리를 보여줄 수 있습니다.
+
+</details>
+
+<details>
+<summary><b>🔍 깊게 파기 #8 — Dirty Checking은 왜 필요한가? 정합성 문제가 있는데도 쓰는 이유</b></summary>
+
+### 8-A. 먼저 오해 정정 — Lost Update는 Dirty Checking의 버그가 아니다
+
+Lost Update는 Dirty Checking이 만든 문제가 **아닙니다**. 이건 **Read-Modify-Write 패턴 자체의 구조적 문제**이고, JDBC로 직접 써도 똑같이 발생합니다:
+
+```java
+// JDBC로 직접 쓴 코드 — Dirty Checking 전혀 없음
+try (Connection conn = dataSource.getConnection()) {
+    conn.setAutoCommit(false);
+
+    // 1) SELECT
+    PreparedStatement s = conn.prepareStatement(
+        "SELECT retry_count FROM reply_requests WHERE id = ?");
+    s.setLong(1, 1L);
+    ResultSet rs = s.executeQuery();
+    rs.next();
+    int current = rs.getInt("retry_count");   // 0
+
+    // 2) Modify (메모리)
+    int next = current + 1;                   // 1
+
+    // 3) UPDATE
+    PreparedStatement u = conn.prepareStatement(
+        "UPDATE reply_requests SET retry_count = ? WHERE id = ?");
+    u.setInt(1, next);
+    u.setLong(2, 1L);
+    u.executeUpdate();
+
+    conn.commit();
+}
+// 여러 스레드가 이걸 동시에 실행하면 → Lost Update 발생. Dirty Checking과 무관.
+```
+
+**결론**: Lost Update의 원인은 **"두 트랜잭션이 같은 시점의 DB를 읽어서 각자 새 값을 덮어쓴다"**는 패턴 자체이지, Hibernate/Dirty Checking이 아닙니다.
+
+### 8-B. 그럼 Dirty Checking의 존재 이유는?
+
+Dirty Checking의 설계 목적은 **정합성 보장이 아니라 "쓰기 편의성 + Transaction 일관성"** 입니다. 구체적으로 6가지:
+
+#### (1) 개발자 경험(DX) — setter만 호출하면 끝
+
+```java
+// Dirty Checking 없이 (전통 JDBC/MyBatis)
+ReplyRequest req = repo.findById(1L);
+req.markProcessing();
+repo.update(req);  // ← 이걸 까먹으면 변경 사라짐
+
+// Dirty Checking 있으면 (JPA)
+ReplyRequest req = repo.findById(1L);
+req.markProcessing();  // 끝. 트랜잭션 종료 시 자동 flush
+```
+
+→ "도메인 객체만 조작하고 저장은 잊어라"가 가능해져 **OOP에 가까운 코드**를 쓸 수 있음.
+
+#### (2) Write-Behind — 중간 변경 여러 번을 UPDATE 한 번으로
+
+```java
+@Transactional
+public void processReplyAndFinish(Long id) {
+    ReplyRequest req = repo.findById(id);
+    req.markProcessing();        // retry_count = 1
+    // ... 외부 API 호출 ...
+    req.markCompleted();          // status = COMPLETED
+    req.setCompletedAt(now());    // completed_at = ...
+}
+// UPDATE는 딱 1번: status, retry_count, completed_at 모두 한 번에
+```
+
+→ 네트워크 round-trip 최소화. JDBC 직접 쓰면 UPDATE 3번 날리기 쉬움.
+
+#### (3) 변경 없으면 UPDATE 자체를 생략
+
+```java
+@Transactional
+public ReplyRequest getReply(Long id) {
+    return repo.findById(id);  // 조회만 하면 UPDATE 안 나감
+}
+```
+
+→ `save()`를 실수로 호출해도 내용이 같으면 SQL 생략. JDBC에선 `UPDATE ... WHERE id=?`가 의미 없이 나감.
+
+#### (4) 트랜잭션 경계 내 "쓰기 일관성"
+
+1차 캐시 + flush 구조 덕분에:
+- 같은 트랜잭션 내에서 같은 ID 조회하면 **항상 같은 객체 인스턴스** (`==` 비교 통과)
+- 한 엔티티를 여러 곳에서 수정해도 마지막에 **하나의 UPDATE**로 정리
+- 객체 그래프의 변경이 커밋 시점에 일관된 순서로 반영
+
+#### (5) Interceptor / Entity Listener 훅 제공
+
+```java
+@Entity
+@EntityListeners(AuditListener.class)
+public class ReplyRequest {
+    @PreUpdate void beforeUpdate() { ... }
+    @PostUpdate void afterUpdate() { ... }
+}
+```
+
+→ Dirty Checking 덕분에 **"변경이 감지되는 시점"**을 훅으로 잡을 수 있음. 감사 로그, 이벤트 발행, 버전 관리 등에 활용.
+
+#### (6) 성능 최적화 여지
+
+- `@DynamicUpdate`: 변경된 필드만 UPDATE 컬럼에 포함
+- Bytecode Enhancement: state-diff 비용 감소
+- Batch flush: 여러 엔티티의 UPDATE를 묶어서 전송
+
+### 8-C. Dirty Checking과 정합성은 '직교(orthogonal)'한다
+
+두 축을 혼동하면 안 됩니다:
+
+```
+              정합성 축 (동시성 대응)
+                    │
+   Serializable ────┤──── 기본 락 없음
+                    │         ↑
+                    │       기본값
+                    │
+   ─────────────────┼───────────────── 쓰기 편의성 축
+                    │
+   JDBC 직접        │       Dirty Checking
+   (수동 update)    │       (자동 flush)
+```
+
+| | JDBC 직접 쓰기 | Dirty Checking (JPA) |
+|---|:---:|:---:|
+| **Lost Update 가능성** | 있음 | 있음 |
+| **정합성 기본 제공** | 없음 | 없음 |
+| **쓰기 편의성** | 낮음 | 높음 |
+| **정합성 보강 수단** | 락, `@Version`, SERIALIZABLE | 동일 |
+
+**핵심**: "Dirty Checking을 쓰든 JDBC를 쓰든 정합성은 **별도로** 설계해야 한다." 둘은 해결하는 문제가 다름.
+
+**비유**:
+- Dirty Checking = **자동 변속기** (운전이 편해짐)
+- 락 = **안전벨트** (사고 방지)
+- 둘 다 필요하고, 자동 변속기를 쓴다고 안전벨트를 안 매도 되는 게 아님
+
+### 8-D. 그럼 언제 Dirty Checking을 '쓰지 말아야' 하나?
+
+Dirty Checking의 비용이 이득을 넘는 상황:
+
+1. **대량 벌크 UPDATE**: 수백만 건을 한 번에 처리할 때는 JPQL/native bulk update가 훨씬 빠름
+   ```java
+   // 이건 JPA로 하면 엔티티 100만 개 로드 + 100만 번 스냅샷 비교 → 죽음
+   em.createQuery("UPDATE ReplyRequest r SET r.status = :s WHERE ...")
+     .setParameter("s", FAILED)
+     .executeUpdate();
+   // 이게 훨씬 빠름 (단점: 1차 캐시 동기화 필요)
+   ```
+
+2. **고빈도 카운터**: 조회수, 좋아요 등은 Redis INCR이 정답
+
+3. **이벤트 소싱**: 상태 스냅샷이 아니라 이벤트 로그로 관리하는 패턴
+
+4. **read-heavy + 락 경합 심함**: 읽기만 JPA로, 쓰기는 명시적 stored procedure 또는 원자적 SQL
+   ```sql
+   -- 이게 Lost Update를 근본적으로 막는 "상대 연산"
+   UPDATE reply_requests SET retry_count = retry_count + 1 WHERE id = ?
+   ```
+
+### 8-E. 면접에서의 정답 문장
+
+> **"Dirty Checking은 '정합성 보장 도구'가 아니라 '쓰기 편의성 도구'입니다. Lost Update는 Dirty Checking의 버그가 아니라 read-modify-write 패턴 자체의 한계고, JDBC로 직접 써도 동일하게 발생합니다. 정합성은 `@Version`, 비관적 락, 분산 락 같은 별도의 축에서 선택적으로 보강해야 하고, 두 축이 직교하기 때문에 Dirty Checking의 이점(DX, write-behind, listener hook)을 유지하면서 정합성을 원하는 구간에만 락을 거는 게 실무 표준입니다."**
+
+이 답변이 "Dirty Checking이 문제 아니냐?"는 함정 질문을 **설계 이해도로 역공**할 수 있는 포인트입니다.
 
 </details>
 
