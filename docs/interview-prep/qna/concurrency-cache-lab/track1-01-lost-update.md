@@ -353,8 +353,8 @@ public class ReplyRequest implements SelfDirtinessTracker {
 ```
 
 **장점**:
-- 스냅샷 `Object[]`를 안 만들어도 됨 → 메모리 절약 (엔티티가 10만 개면 절감 크고)
-- flush 시 비교 루프 생략 → 속도 향상
+- **state-diff 비용 감소**: flush 시 "엔티티에게 무엇이 바뀌었는지 직접 묻는" 방식으로 전환되어 전체 필드 비교 루프 부담이 줄어듦
+- 메모리 절약: 구현에 따라 스냅샷 보유 방식이 최적화될 수 있음 (단, "스냅샷을 항상 완전히 없앤다"는 공식 보증은 아니므로 단정은 금물)
 - "정말로 바뀐 필드"만 추적돼서 `@DynamicUpdate`의 효과 극대화
 
 **비용**:
@@ -364,10 +364,12 @@ public class ReplyRequest implements SelfDirtinessTracker {
 
 ### 3-D. Dirty Checking의 두 경로 (요약)
 
-| 경로 | Enhancement | 스냅샷 생성 | flush 비교 |
+| 경로 | Enhancement | 변경 감지 방식 | flush 비교 비용 |
 |------|:---:|---|---|
-| **기본** | ✗ | `Object[] loadedState` 배열 복제 | 필드별 `Type.isDirty()` 전체 비교 |
-| **Enhanced** | ✓ | 불필요 (tracker만 있음) | tracker의 dirty 필드 목록 바로 읽음 |
+| **기본** | ✗ | flush 시점에 **현재 상태 vs loadedState**를 필드별 diff | O(필드 수) 전체 비교 |
+| **Enhanced** | ✓ | 엔티티가 **자기가 뭘 바꿨는지 직접 보고**하는 방식 (self-dirty tracking) | state-diff 비용 감소 |
+
+> ⚠️ "Enhanced = 스냅샷이 완전히 없다"는 단정은 피하세요. Hibernate 공식 문서도 "state-diff 대신 엔티티에게 묻는다" 정도로 설명하고, 내부 최적화의 구체 범위는 버전/설정에 따라 다릅니다. **핵심 메시지는 'state-diff 비용을 줄인다'**입니다.
 
 실험의 `concurrency-cache-lab`은 Enhancement를 켜지 않은 상태라 **기본 경로**로 동작합니다. 그래서 Q1 본문의 설명은 기본 경로 기준.
 
@@ -387,13 +389,18 @@ public class ReplyRequest {
 }
 ```
 
-**문제의 본질**: JPA의 `@OneToOne(fetch = LAZY)`는 **대부분 작동하지 않고 EAGER처럼 동작**합니다.
+**문제의 본질**: Hibernate에서 **singular association의 LAZY는 제약이 많습니다**. 특히 비주인 측(non-owning side)의 `@OneToOne`은 null/객체 판정을 위해 실제 로딩이 필요한 경우가 있어, 설정에 따라 EAGER처럼 동작할 수 있습니다.
 
-**이유**: `review`가 null인지 객체인지 판단하려면 어차피 DB를 읽어야 함. 프록시를 만들 수는 있지만 `review == null` 체크가 true/false로 정확히 나오려면 실제 로딩이 필요.
+**정리**:
+- **@ManyToOne(fetch = LAZY)**: 외래 키 값이 엔티티 자신에게 있어서 프록시로 처리 가능 → 일반적으로 의도대로 LAZY 동작
+- **@OneToOne(fetch = LAZY) (주인 측)**: 외래 키를 본인이 갖고 있으면 프록시 처리 가능
+- **@OneToOne(fetch = LAZY) (비주인 측, `mappedBy`)**: null 여부 판별에 원격 조회가 필요해 **LAZY가 제약됨**
 
 **해결**: Bytecode Enhancement + `@LazyToOne(LazyToOneOption.NO_PROXY)`
-- 소유 측 엔티티의 `review` 필드에 접근할 때마다 Enhancement 코드가 가로채서 **그 시점에만 DB fetch**
-- 프록시 없이 진짜 지연 로딩
+- 소유 측 엔티티의 필드 접근 시점에 Enhancement 코드가 가로채서 **그 시점에만 DB fetch**
+- 프록시 없이 진짜 지연 로딩 가능
+
+> 단, provider(Hibernate/EclipseLink), 버전, owner 여부, Enhancement 설정이 겹쳐 결과가 달라지므로 면접에서는 **"Hibernate 기준 singular association LAZY는 제약이 많아서 bytecode enhancement와 함께 보는 게 안전하다"** 정도로 톤을 낮추는 게 정확합니다.
 
 ### 4-B. `@DynamicUpdate` vs Dirty Tracking 관계
 
@@ -409,8 +416,8 @@ public class ReplyRequest { ... }
 | **@DynamicUpdate** | 감지된 dirty 필드만 UPDATE 문에 포함 (SQL 생성) |
 
 둘은 **독립적**:
-- `@DynamicUpdate` 없음 + Enhancement 없음: 모든 필드로 `UPDATE` 생성, 쿼리 캐시 잘 됨
-- `@DynamicUpdate` 있음 + Enhancement 없음: dirty 필드만 포함, 매번 다른 SQL (statement cache miss)
+- `@DynamicUpdate` 없음 + Enhancement 없음: 모든 필드로 `UPDATE` 생성 → **SQL이 고정 형태 → JDBC prepared statement 캐시 재사용성 높음**
+- `@DynamicUpdate` 있음 + Enhancement 없음: dirty 필드만 포함 → **SQL이 매번 달라져 statement 캐시 재사용성 낮음**
 - Enhancement 있음: 위 둘의 감지 방식만 달라짐, 생성되는 SQL은 `@DynamicUpdate` 여부에 따라 결정
 
 ### 4-C. `@Version` — 낙관적 락
@@ -583,7 +590,7 @@ void printStats() {
 ### 6-C. Hibernate Interceptor로 dirty 필드 실시간 관찰
 
 ```java
-@Component
+// no-arg 생성자 필수 — Hibernate가 FQCN으로 인스턴스 생성
 public class DirtyCheckLoggingInterceptor implements Interceptor {
 
     @Override
@@ -597,17 +604,39 @@ public class DirtyCheckLoggingInterceptor implements Interceptor {
                     + ": " + previousState[i] + " → " + currentState[i]);
             }
         }
-        log.info("[DIRTY] {} id={} changes={}",
-            entity.getClass().getSimpleName(), id, dirty);
+        System.out.println("[DIRTY] " + entity.getClass().getSimpleName()
+            + " id=" + id + " changes=" + dirty);
         return false;  // Hibernate의 기본 dirty 계산을 그대로 사용
     }
 }
 ```
 
-**Spring Boot 등록**:
+**등록 방법 2가지**:
+
+**(1) Hibernate 설정으로 FQCN 지정 (가장 간단, Spring DI 없음)**
 ```yaml
-spring.jpa.properties.hibernate.session_factory.interceptor: com.lemong.lab.DirtyCheckLoggingInterceptor
+spring:
+  jpa:
+    properties:
+      hibernate:
+        session_factory.interceptor: com.lemong.lab.DirtyCheckLoggingInterceptor
 ```
+Hibernate가 no-arg 생성자로 직접 인스턴스화합니다. **Spring bean 주입은 되지 않으므로** `@Autowired` 필드가 있으면 null입니다.
+
+**(2) HibernatePropertiesCustomizer로 Spring bean을 주입하고 싶을 때**
+```java
+@Configuration
+class HibernateConfig {
+    @Bean
+    HibernatePropertiesCustomizer interceptorCustomizer(
+            DirtyCheckLoggingInterceptor interceptor) {
+        return props -> props.put("hibernate.session_factory.interceptor", interceptor);
+    }
+}
+```
+이렇게 하면 Spring이 만든 bean 인스턴스를 Hibernate에 넘길 수 있어 DI가 작동합니다 (생성자 주입 등).
+
+> 흔한 오해: `@Component`만 붙이면 Hibernate가 알아서 쓰는 줄 알지만, Hibernate는 Spring ApplicationContext를 모릅니다. 두 방식 중 하나를 명시적으로 연결해야 합니다.
 
 **확인할 수 있는 것**:
 - `currentState` = 현재 엔티티 필드값
@@ -782,24 +811,23 @@ class LostUpdateReproductionTest {
 - 주식 주문 시 사용자 자산 차감/보유 수량 변경이 동시 다발적으로 발생
 - **단 1원도 틀리면 안 되는** 금융 시스템
 
-**해결** (공개된 내용):
+**해결** (발표 자료 기준):
 - **분산 락**으로 동시성 제어 (1차 방어)
-- **JPA `@OptimisticLocking` (`@Version`)** 으로 갱신 분실 감지 (2차 방어)
-- 이 둘을 **CAS(Compare-And-Swap) 연산 패턴**으로 결합
+- **JPA `@Version` 기반 낙관적 락**으로 갱신 분실 감지 (2차 방어)
+- 이 둘을 **CAS(Compare-And-Swap) 스타일 패턴**으로 결합
 - 락으로 충돌 자체를 줄이고, 혹시 샌 경우 낙관적 락이 예외로 잡음
 
 **교훈**: "금융은 방어선이 하나면 안 된다." 단일 락에만 의존하면 Redis 장애 시 즉시 사고. **이중/삼중 방어** 필수.
 
-출처: https://toss.im/slash-22 (SLASH 22 컨퍼런스)
+출처:
+- SLASH 22 페이지: https://toss.im/slash-22
+- 발표 슬라이드 PDF: https://static.toss.im/assets/homepage/slash22/pt-session/SLASH22_%EC%9D%B4%EC%8A%B9%EC%B2%9C%EB%8B%98.pdf
 
-#### 5. 카카오페이 기술 블로그 (tech.kakaopay.com)
+#### 5. 카카오페이 기술 블로그 (일반 패턴 참조)
 
-결제/정산 시스템의 멱등성 관련 글들이 여러 편 공개되어 있고, 공통된 패턴은:
-- **idempotency key 기반 중복 결제 방지**
-- **분산 락 + DB 유니크 제약**의 이중 방어
-- 실패/성공 상태 머신 관리
+카카오페이 기술 블로그에는 결제/정산 관련 글이 여러 편 공개되어 있지만, **이 문서 작성 시점에 Lost Update/분산 락/멱등성을 직접 다루는 특정 글의 URL은 확인하지 못했습니다.** 업계에서 일반적으로 통용되는 결제 시스템 패턴(멱등성 키, 분산 락, DB 유니크 제약 3중 방어)과 맥락이 같다고 보되, 면접에서 구체적 인용이 필요하면 별도 확인 후 사용해야 합니다.
 
-출처: https://tech.kakaopay.com/
+블로그 진입점: https://tech.kakaopay.com/ (주제별 글을 직접 확인 필요)
 
 ---
 
@@ -819,7 +847,9 @@ class LostUpdateReproductionTest {
 
 **교훈**: **"멱등성은 서버 책임이지만, 키 생성은 클라이언트 책임."** 클라이언트가 재시도마다 같은 키를 보내야 의미가 있고, 이를 위해 SDK가 자동으로 UUID를 생성해줘야 함.
 
-출처: https://stripe.com/blog/idempotency
+출처:
+- 엔지니어링 블로그 (2017): https://stripe.com/blog/idempotency
+- 공식 API 문서 (현행): https://docs.stripe.com/api/idempotent_requests
 
 #### 2. Airbnb — "Avoiding Double Payments in a Distributed Payments System"
 
@@ -843,14 +873,15 @@ class LostUpdateReproductionTest {
 - Black Friday 같은 플래시 세일에 **초당 수만 건의 쓰기 트래픽** 발생
 - 같은 상품에 재고 차감이 동시에 들어오면 오버셀 위험
 
-**해결**:
+**해결** (블로그에서 직접 확인된 내용):
 - **Pod 아키텍처**: 샵 단위로 DB를 샤딩해 독립된 pod으로 격리
-- **Scriptable Load Balancer + Leaky Bucket**: 엣지에서 초당 요청 수 제한
-- DB 레벨에선 **재고 차감에 명시적 락** (공개된 세부 구현은 DB SELECT FOR UPDATE 기반)
+- **Scriptable Load Balancer + Leaky Bucket**: 엣지에서 초당 요청 수를 제한해 DB까지 도달하는 트래픽 자체를 조절
+
+> 참고: "재고 차감이 `SELECT FOR UPDATE` 기반이다"는 구체 구현은 해당 블로그 글에서 명시적으로 확인되지 않습니다. DB 레벨 락 전략은 일반적 추정이므로 면접에서는 언급하지 않는 게 안전합니다.
 
 **교훈**: "락만으로는 절대 못 막는다." 락은 DB까지 도달한 요청을 직렬화할 뿐, **트래픽 자체를 엣지에서 걸러야** 시스템이 산다.
 
-출처: https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-i
+출처: https://shopify.engineering/blogs/engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-i
 
 #### 4. Uber — "Real-Time Exactly-Once Event Processing with Flink, Kafka, Pinot"
 
@@ -865,7 +896,9 @@ class LostUpdateReproductionTest {
 
 **교훈**: "exactly-once delivery는 불가능하지만 exactly-once processing은 가능하다." 핵심은 **멱등한 쓰기 연산(upsert)** + **고유 식별자**.
 
-출처: https://www.infoq.com/news/2021/11/exactly-once-uber-flink-kafka/
+출처 (1차):
+- Uber Engineering 공식 블로그: https://www.uber.com/en-CH/blog/real-time-exactly-once-ad-event-processing/
+- 참고 요약 (2차): https://www.infoq.com/news/2021/11/exactly-once-uber-flink-kafka/
 
 #### 5. Martin Kleppmann — "How to do distributed locking" (Redlock 비판)
 
@@ -949,7 +982,13 @@ T2: COMMIT → DB = 1 (T1 변경 덮어씀)
 
 X-lock은 T2가 T1을 기다리게 만들었지만, T2가 **'현재 DB 값이 뭔지 재확인하는 단계'**가 없습니다. 자기가 아는 메모리 상태로 덮어쓸 뿐입니다.
 
-> 정확히 말하면, **일반 SELECT에 락이 없어서** Lost Update가 발생합니다. `SELECT ... FOR UPDATE`를 썼다면 T2가 SELECT 단계부터 대기했을 거고, T1 커밋 후 다시 읽어서 1을 보고 2로 업데이트했을 겁니다."
+> 정확히 말하면, **일반 SELECT가 locking read가 아니라서** Lost Update가 발생합니다. 읽기 경로를 세 가지로 분리해 보면 명확합니다:
+>
+> - **일반 SELECT** (MVCC consistent read): 어떤 트랜잭션이 X-lock을 갖고 있어도 자기 스냅샷을 락 없이 그대로 읽음. 이게 우리 시나리오의 T1/T2가 동시에 `retry_count=0`을 읽을 수 있는 이유.
+> - **`SELECT ... FOR UPDATE`** (locking read): 명시적 X-lock 획득. 같은 행을 lock read로 잡은 다른 트랜잭션이 있으면 대기. 일반 SELECT는 여전히 MVCC로 통과하지만, 이 경로로 들어오는 트랜잭션끼리는 직렬화됨.
+> - **SERIALIZABLE + autocommit off**: 일반 SELECT도 사실상 locking read로 동작해 직렬 실행에 가까워짐.
+>
+> 따라서 이 시나리오에서 `T2: SELECT FOR UPDATE`를 썼다면, **T2의 locking read**가 T1이 보유한 X-lock을 기다렸다가 T1 커밋 후 갱신된 값(1)을 읽어 `retry_count=2`로 UPDATE했을 것입니다. 다만 '일반 SELECT까지 막히는 건 아니다'는 점을 구분해서 말해야 합니다."
 
 ### [꼬리질문] "그럼 SERIALIZABLE로 올리면 해결되죠? 왜 기본값을 그걸로 안 하나요?"
 
