@@ -1177,6 +1177,415 @@ Dirty Checking의 비용이 이득을 넘는 상황:
 
 </details>
 
+<details>
+<summary><b>🔍 깊게 파기 #9 — Dirty Checking 관련 공개 사례 + 직접 체감할 실험 설계</b></summary>
+
+### 9-A. 공개된 실무 사례
+
+#### [카카오페이] "JPA Transactional 잘 알고 쓰고 계신가요?"
+
+**문제**:
+- 온라인 결제 서비스에서 클래스 단위 `@Transactional` 남발
+- MySQL `set_option` 쿼리가 **약 14K 수준**으로 비정상 발생 (세션 isolation 변경)
+- DB 커넥션/리소스 부담 증가
+
+**해결**:
+- 읽기만 하는 메서드에는 `@Transactional(readOnly = true)`로 명시
+- **읽기 전용 모드**는 Hibernate가 **스냅샷을 저장하지 않음** → Dirty Checking 비용 제거
+- 불필요한 클래스 단위 `@Transactional` 제거, 쓰기 메서드에만 선택적 적용
+
+**교훈**: "`@Transactional` 남발은 Dirty Checking의 스냅샷 비용까지 동반한다." 이게 JPA의 숨은 비용.
+
+출처: https://tech.kakaopay.com/post/jpa-transactional-bri/
+
+#### [우아한형제들] JPA 도입 배경과 적용 사례
+
+- JPA + Spring Data를 사내 표준 스택으로 채택
+- 도메인 객체 중심 설계로 비즈니스 로직을 엔티티 메서드에 집중
+- Dirty Checking 덕분에 "도메인 객체만 조작하고 저장은 잊어라" 스타일 정착
+
+출처: https://techblog.woowahan.com/2598/
+
+#### [Vlad Mihalcea 벤치마크] Bytecode Enhancement Dirty Tracking 성능
+
+> 실제 벤치마크 공개 (Hibernate 공식 컨트리뷰터의 실측):
+
+| 시나리오 | 기본 Dirty Checking 대비 |
+|---------|-------------------------|
+| 100 엔티티 관리 | 큰 차이 없음 |
+| **1,000 엔티티 / 500개 변경** | **+13.5% 향상** |
+| **5,000 엔티티 / 1,000개 변경** | **+10.25% 향상** |
+
+→ "Persistence Context 규모가 커질수록 Enhancement의 이득이 커진다."
+
+출처: https://vladmihalcea.com/hibernate-4-bytecode-enhancement/
+
+#### [Lazy Initialization Enhancement] 실측 개선
+
+- 쿼리 수: **240 → 124 (48% 감소)**
+- 요청 처리 시간: **40% 감소**
+
+→ @LazyToOne + Bytecode Enhancement 조합의 실측 효과.
+
+출처: https://medium.com/@justinhughes82/hibernate-bytecode-enhancement-lazy-loading-713b4eb42d0e
+
+#### [@DynamicUpdate 실측 트레이드오프]
+
+**효과가 있는 경우**:
+- 컬럼이 수십~수백 개인 엔티티에서 한두 개만 변경되는 케이스
+- 네트워크 payload 감소, 인덱스 재계산 최소화
+
+**효과가 없거나 손해인 경우**:
+- **Prepared Statement 캐시 재사용성 감소** (SQL이 매번 다름 → 캐시 miss)
+- **매 flush마다 추가 dirty 검사 비용**
+- `@LastModifiedDate` 같은 감사 필드가 항상 dirty로 잡힘 → 컬럼 선택 의미 약화
+- 쓰기 트래픽이 높은 테이블에선 오히려 손해
+
+출처: https://medium.com/jpa-java-persistence-api-guide/optimizing-hibernate-and-spring-data-jpa-with-dynamicinsert-and-dynamicupdate-2677d92c5f10
+
+#### [Vlad Mihalcea] Hibernate 커미터의 심층 분석 (필독)
+
+Hibernate ORM의 주요 커미터이자 High-Performance Java Persistence 저자가 직접 쓴 글들. **실무 JPA 튜닝의 표준 레퍼런스**.
+
+| 주제 | URL | 핵심 요지 |
+|------|-----|----------|
+| Dirty Checking 해부 | https://vladmihalcea.com/the-anatomy-of-hibernate-dirty-checking/ | 기본 메커니즘이 reflection 기반이라 엔티티/필드가 많을수록 성능 영향 |
+| 1차 캐시 내부 구조 | https://vladmihalcea.com/jpa-hibernate-first-level-cache/ | Map 기반 키-엔티티 추적, EntityEntry와 loadedState의 의미 |
+| Bytecode Enhancement 활성화 | https://vladmihalcea.com/how-to-enable-bytecode-enhancement-dirty-checking-in-hibernate/ | build-time 적용이라 런타임 오버헤드 없음. dirty 필드 마킹 방식의 효율성 |
+| Dirty Checking 커스터마이징 | https://vladmihalcea.com/how-to-customize-hibernate-dirty-checking-mechanism/ | Interceptor/CustomEntityDirtinessStrategy로 개입하는 법 |
+| Spring `@Transactional(readOnly=true)` 최적화 | https://vladmihalcea.com/spring-read-only-transaction-hibernate-optimization/ | hydrated state 폐기 + JDBC `setReadOnly(true)` → DB 엔진 차원 최적화 |
+| 종합 튜닝 팁 | https://vladmihalcea.com/hibernate-performance-tuning-tips/ | 읽기 전용, BatchSize, fetch 전략, 2차 캐시 등의 체크리스트 |
+
+**관통하는 메시지**:
+> "Dirty Checking은 기본 동작이 reflection 기반이라 규모가 커지면 비용이 드러납니다. 해결은 (1) 읽기 전용 트랜잭션으로 스냅샷 자체를 안 만들기, (2) Bytecode Enhancement로 dirty tracking을 엔티티에 내장시키기, (3) 필요 없으면 1차 캐시에 엔티티를 올리지 않기. 세 가지 레버를 상황에 맞게 조합하는 게 고성능 JPA의 본질."
+
+#### [Thorben Janssen] JPA 실무 패턴
+
+Hibernate Tips 저자, 공식 트레이닝 제공자. 블로그에는 수백 편의 실무 패턴 글이 있음.
+
+- 메인: https://thorben-janssen.com/
+- Spring Data JPA 로깅 설정: https://thorben-janssen.com/spring-data-jpa-logging/
+- `@DynamicUpdate`/`@DynamicInsert` 실전: https://thorben-janssen.com/dynamic-inserts-and-updates-with-spring-data-jpa/
+
+**실무 관점**: "Hibernate는 기본 설정으로도 대부분 동작하지만, 트래픽이 높아지거나 엔티티가 많아지면 '기본값'이 비용이 된다. 가장 먼저 켜야 할 스위치는 `@Transactional(readOnly)`, 그 다음 `JOIN FETCH`, 그 다음 Bytecode Enhancement."
+
+---
+
+### 9-B. 내 Repo에 추가할 "Dirty Checking Lab" 실험 설계
+
+`concurrency-cache-lab`에 **5개의 마이크로 실험**을 추가해서 직접 체감합니다. 각 실험은:
+- 같은 워크로드를 **다른 설정**으로 돌려 Before/After 비교
+- **k6 부하 테스트 + Hibernate Statistics + Prometheus/Grafana**로 측정
+- 결과를 `docs/experiments/dirty-checking-*.md`에 기록
+
+#### 실험 DC-1: 읽기 전용 `@Transactional(readOnly = true)` 효과
+
+**가설**: 읽기 전용 모드면 스냅샷 생성이 생략되어 메모리/flush 비용이 감소한다.
+
+**구현**:
+```java
+@Service
+class ReplyQueryService {
+    @Transactional(readOnly = true)
+    public ReplyRequest getReply(Long id) {  // 스냅샷 X
+        return replyRepo.findById(id).orElseThrow();
+    }
+
+    @Transactional
+    public ReplyRequest getReplyWithSnapshot(Long id) {  // 스냅샷 O (대조군)
+        return replyRepo.findById(id).orElseThrow();
+    }
+}
+```
+
+**측정**:
+- k6: `GET /api/reply-requests/{id}` 엔드포인트 2개 (readOnly / default) 각각 5분 부하
+- Hibernate Statistics: `getFlushCount()`, `getEntityLoadCount()`
+- JFR: GC 빈도, Eden 영역 할당률
+- Grafana: `http_server_requests_seconds`, `jvm_gc_pause`
+
+**기대 결과**: readOnly 쪽이 GC 부하 낮음, flush 호출 없음.
+
+#### 실험 DC-2: `@DynamicUpdate` 유무 비교 (필드 많은 엔티티)
+
+**가설**: 컬럼이 많고 변경 필드가 적으면 `@DynamicUpdate`가 이득이지만, statement cache miss로 인한 손해도 측정 가능하다.
+
+**구현**:
+```java
+// 필드 20개짜리 UserProfile 엔티티 추가
+@Entity
+class UserProfile {
+    // @DynamicUpdate 없음 (대조)
+    // 별도 브랜치나 설정 토글로 @DynamicUpdate 적용 버전 운영
+    @Id Long id;
+    String field01; String field02; ... String field20;
+}
+```
+
+**측정**:
+- 100 스레드가 `field01`만 변경하는 k6 시나리오
+- p6spy 로그에서 UPDATE SQL 길이 비교 (20 컬럼 vs 1 컬럼)
+- MySQL `performance_schema.prepared_statements_instances` 로 statement cache 확인
+- 네트워크 payload 크기 (Wireshark or MySQL `status_bytes_sent`)
+
+**기대 결과**: payload는 감소하지만 고부하에서 statement cache miss로 총 TPS는 미세하게 저하 가능.
+
+#### 실험 DC-3: Bytecode Enhancement 전후 비교 (대규모 엔티티)
+
+**가설**: Persistence Context에 수천 개 엔티티를 관리할 때 Enhancement가 명확히 이득.
+
+**구현**:
+```groovy
+// build.gradle
+plugins { id 'org.hibernate.orm' version '6.x' }
+hibernate {
+    enhancement {
+        enableDirtyTracking = true   // 실험 토글
+    }
+}
+```
+
+**시나리오**: 한 트랜잭션에서 5,000개 엔티티 조회 → 일부 변경 → flush 까지 시간 측정
+
+**측정**:
+- `System.nanoTime()`으로 flush 구간 측정
+- Hibernate Statistics
+- JFR/Async Profiler로 `dirtyCheck` 구간 CPU 샘플링
+- javap로 `$$_hibernate_*` 메서드 생성 확인 (Enhancement 적용 검증)
+
+**기대 결과**: Enhancement 쪽 flush 시간 ~10% 감소 (Vlad 벤치마크와 비교).
+
+#### 실험 DC-4: JDBC 직접 쓰기 vs JPA Dirty Checking — 같은 트랜잭션 내 자기 Lost Update
+
+**가설**: 1차 캐시 없는 JDBC는 같은 트랜잭션 내에서도 변경이 사라질 수 있다.
+
+**구현**:
+```java
+// JDBC 버전
+@Transactional
+public void jdbcScenario(Long id) {
+    ReplyRequest a = jdbcSelect(id);    // 새 객체
+    ReplyRequest b = jdbcSelect(id);    // 별개 새 객체
+
+    a.setLocked(true);
+    b.markProcessing();
+
+    jdbcUpdate(a);   // locked=true, retry_count=0
+    jdbcUpdate(b);   // locked=false(!), retry_count=1  ← a의 locked 변경 소실
+}
+
+// JPA 버전 (대조)
+@Transactional
+public void jpaScenario(Long id) {
+    ReplyRequest a = repo.findById(id);
+    ReplyRequest b = repo.findById(id);   // 1차 캐시 → 같은 객체
+    a.setLocked(true);
+    b.markProcessing();
+    // 자동 flush 시 locked=true, retry_count=1 모두 반영
+}
+```
+
+**측정**: 두 시나리오 후 DB 상태를 테스트로 검증. 그 자체가 결과 (성능 비교 아님).
+
+**가치**: "JPA가 자기 Lost Update를 구조적으로 방지한다"를 **실행 가능한 테스트**로 증명.
+
+#### 실험 DC-5: 서비스 레이어 분리 시 SELECT/UPDATE 횟수
+
+**가설**: JPA는 같은 ID 반복 조회가 캐시로 흡수되어 SELECT/UPDATE가 단일화.
+
+**구현**:
+```java
+@Transactional
+public void processReplyFully(Long id) {
+    validationService.validate(id);         // findById 내부 호출
+    lockService.markLocked(id);             // findById + setLocked
+    scraperClient.register(id);
+    completionService.markCompleted(id);    // findById + markCompleted
+}
+```
+
+**측정**:
+- p6spy로 실제 발행된 SELECT/UPDATE 횟수 카운트
+- Hibernate Statistics `getEntityLoadCount()`, `getEntityUpdateCount()`
+- 대조군으로 JDBC 스타일 버전 작성해서 비교
+
+**기대 결과**:
+- JPA: SELECT 1 + UPDATE 1
+- JDBC: SELECT 4 + UPDATE 4
+
+---
+
+### 9-C. 부하 테스트 전략
+
+#### 공통 셋업
+
+| 항목 | 값 |
+|------|------|
+| **부하 도구** | k6 (이미 셋업됨) |
+| **시나리오** | 30초 warm-up + 60초 steady load + 30초 ramp-down |
+| **VU 수** | 50 (baseline 수준) |
+| **반복** | 3회, 중앙값 |
+| **메트릭 수집** | Hibernate Statistics + Prometheus + Grafana |
+
+#### 각 실험별 k6 스크립트 패턴
+
+```javascript
+// docker/k6/dirty-checking-dc1.js
+import http from 'k6/http';
+import { sleep } from 'k6';
+
+export const options = {
+  scenarios: {
+    readonly: {
+      executor: 'constant-vus', vus: 50, duration: '1m',
+      exec: 'readOnly',
+    },
+    default: {
+      executor: 'constant-vus', vus: 50, duration: '1m', startTime: '1m30s',
+      exec: 'defaultTx',
+    },
+  },
+};
+
+export function readOnly() {
+  http.get('http://host.docker.internal:8080/api/reply-requests/1?mode=readonly');
+  sleep(0.1);
+}
+
+export function defaultTx() {
+  http.get('http://host.docker.internal:8080/api/reply-requests/1?mode=default');
+  sleep(0.1);
+}
+```
+
+#### 측정 대시보드 추가 패널
+
+현재 Grafana 대시보드에 다음 패널 신설:
+
+```promql
+# 1. 초당 flush 횟수
+rate(hibernate_sessions_flushes_total[30s])
+
+# 2. Dirty 검사된 엔티티 수
+rate(hibernate_entities_updates_total[30s])
+
+# 3. 1차 캐시 히트율
+hibernate_second_level_cache_hits_total
+  / (hibernate_second_level_cache_hits_total + hibernate_second_level_cache_misses_total)
+
+# 4. 트랜잭션당 평균 SELECT 횟수 (lab 커스텀 메트릭 필요)
+rate(lab_jpa_selects_per_tx_sum[30s])
+  / rate(lab_jpa_selects_per_tx_count[30s])
+```
+
+Spring Boot Actuator에 Micrometer의 `hibernate-jcache` / `hibernate-metrics` 바인더를 추가하면 위 메트릭이 자동 노출됩니다.
+
+---
+
+### 9-D. 실험 진행 로드맵
+
+| Phase | 이슈 | 내용 |
+|-------|------|------|
+| **Phase 1** | #DC-1 | readOnly 트랜잭션 효과 (가장 쉬움, 카카오페이 사례 재현) |
+| **Phase 2** | #DC-4 | JDBC vs JPA 자기 Lost Update (테스트만 필요, 부하 없음) |
+| **Phase 3** | #DC-5 | 서비스 레이어 분리 SELECT/UPDATE 단일화 효과 |
+| **Phase 4** | #DC-2 | @DynamicUpdate 트레이드오프 측정 |
+| **Phase 5** | #DC-3 | Bytecode Enhancement 벤치마크 (대규모 엔티티 필요) |
+
+각 Phase 완료 시:
+1. `docs/experiments/dirty-checking-dcN.md` 실험 문서 생성
+2. portfolio-docs의 이 Q&A 문서 9-B 섹션에 **실측 수치** 추가 ("예상" → "실측")
+3. 커밋 + Issue 닫기
+
+---
+
+### 9-E. 이 실험을 하면 얻는 것
+
+면접에서 답변할 수 있게 되는 질문들:
+
+> "JPA의 Dirty Checking이 왜 필요한지 체감하셨나요?" → **실측 수치로 답변**
+> "readOnly 트랜잭션은 실제로 어떤 차이가 있나요?" → **카카오페이 사례 + 본인 실험**
+> "@DynamicUpdate는 항상 좋은가요?" → **실측으로 트레이드오프 제시**
+> "Bytecode Enhancement는 어떤 효과가 있나요?" → **Vlad 벤치마크 재현 + 본인 수치**
+
+**핵심 가치**: "블로그에서 본 이야기"를 **"내가 직접 측정한 이야기"**로 한 단계 격상.
+
+---
+
+### 9-F. 해결력 증명 스토리라인 (면접용 서사)
+
+이 섹션이 이 모든 실험의 **진짜 목적**입니다. 단순 지식이 아니라 **"문제 → 탐구 → 실험 → 해결 → 증명"의 내러티브**로 Java/Spring/JPA 해결력을 입증.
+
+#### 4단계 서사 구조
+
+```
+[1] 운영에서 문제 발견
+  "배달 플랫폼 댓글 등록 사고 — 중복 답글 등록"
+  └─ 현장에서 '왜 생겼는지'를 직접 목격
+
+[2] 원인을 CS 레벨로 분해
+  "JPA Dirty Checking이 DB 현재 상태를 재확인 안 한다"
+  "InnoDB MVCC + X-lock의 구조적 한계"
+  └─ 현상을 원리로 환원
+
+[3] 공개 사례/문헌과 엮기
+  "Vlad Mihalcea의 dirty checking 해부 글, 카카오페이의 트랜잭션 튜닝,
+   Airbnb Orpheus, Stripe idempotency, 토스 CAS 패턴을 읽고 내 문제에 대입"
+  └─ 업계 표준 해법을 내 상황에 맞춰 선택
+
+[4] 재현 가능한 실험으로 증명
+  "Lost Update 실측 88건, @Version/비관적/분산 락 각각의 TPS Before/After,
+   readOnly 트랜잭션 효과, Bytecode Enhancement 벤치마크"
+  └─ 주장을 수치로 뒷받침
+```
+
+#### 면접에서의 실제 답변 템플릿
+
+> **"저는 운영 중인 B2B SaaS의 배달앱 댓글 등록 시스템에서 외부 플랫폼에 답글이 중복 등록되는 사고를 겪었습니다. 원인을 찾는 과정에서 문제가 단순한 버그가 아니라 JPA Dirty Checking의 근본 동작, InnoDB MVCC, 그리고 분산 환경에서의 멱등성 설계가 모두 얽힌 문제라는 걸 알게 됐습니다.**
+>
+> **이후 Vlad Mihalcea의 Hibernate 공식 커미터 레퍼런스, 카카오페이의 JPA Transactional 운영 후기, Airbnb Orpheus와 Stripe Idempotency Key 글들을 체계적으로 읽고, 우리 도메인에 맞춰 'Redis SETNX 락 + 외부 조회 재검증 + DLQ'의 3중 방어 구조를 설계·운영했습니다.**
+>
+> **그 결과를 재현 가능한 형태로 정리하려고 `concurrency-cache-lab` 저장소에 실험을 구축했습니다. 100 스레드 동시 호출 시 retry_count가 88건 Lost Update 되는 것, @Version을 붙이면 OptimisticLockException으로 감지되지만 고충돌에서 livelock으로 수렴하는 것, 분산 락 도입 후 외부 API 중복 호출이 사라지는 것을 실측 수치로 증명했고, readOnly 트랜잭션·@DynamicUpdate·Bytecode Enhancement의 효과도 직접 벤치마크했습니다.**
+>
+> **이 과정으로 저는 Java/Spring/JPA의 표면 사용이 아니라, 내부 동작과 트레이드오프, 그리고 운영 사고를 원리로 풀어내는 해결력을 쌓았다고 생각합니다.**"
+
+#### 왜 이 서사가 먹히는가
+
+| 면접관이 판단하는 지점 | 이 서사로 증명되는 것 |
+|---------------------|--------------------|
+| **문제를 찾는 감각** | 사고를 놓치지 않고 원인까지 파고들었다 |
+| **CS 기초** | Dirty Checking, MVCC, 락 이론을 원리 수준에서 이해 |
+| **학습 방법론** | 공식 커미터 글, 대기업 기술 블로그, 논문/비판까지 읽는다 |
+| **실행력** | 읽은 내용을 재현 가능한 실험으로 구축한다 |
+| **수치 근거 사고** | "아마 그럴 것" 대신 "실측 결과 N건"으로 말한다 |
+| **아키텍처 판단** | 단일 해법이 아니라 3중 방어 같은 운영 구조를 설계한다 |
+
+#### 실제 이 Repo가 증명하는 것
+
+```
+├── concurrency-cache-lab (실험 코드)
+│   ├── Lost Update 재현 테스트
+│   ├── 락별 Before/After 벤치마크 (예정)
+│   ├── Dirty Checking Lab (예정: DC-1 ~ DC-5)
+│   └── 재현 가능한 Testcontainers + k6 환경
+│
+├── portfolio-docs (개념/설계)
+│   ├── 이 Q&A 문서 (이론 → 공개 사례 → 실험 → 서사)
+│   ├── ADR (기술 결정 근거)
+│   └── EXPERIENCE-STORIES (실무 경험)
+│
+└── 운영 시스템 (현업)
+    ├── 실제 사고 경험
+    └── Redis SETNX + DLQ + reconciliation 구축
+```
+
+세 축이 서로를 뒷받침합니다:
+- **이론 (블로그/논문)** ← **실험 (repo)** ← **경험 (운영)**
+
+면접관에게 "이 사람은 배운 걸 실제 시스템과 재현 가능한 실험 둘 다로 검증한다"는 인상을 남길 수 있는 구조.
+
+</details>
+
 ---
 
 ### [꼬리질문] "1차 캐시는 어떤 자료구조로 되어있나요?"
